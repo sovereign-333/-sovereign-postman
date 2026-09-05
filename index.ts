@@ -10,23 +10,20 @@ import https from 'https';
 dotenv.config();
 
 // ---------------------------------------------------------
-// [STRATEGY 1]: MULTI-RPC FALLBACK (แก้ไข Quorum = 1 และฝัง ChainId 8453 ให้ถูกตำแหน่ง)
+// [STRATEGY 1]: MULTI-RPC FALLBACK
 // ---------------------------------------------------------
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0x920c1f00EF178B3C060BD39a6a3f449BA2b230C9';
 
-// ลำดับ RPC: ดึง Alchemy ขึ้นเป็น Priority หลัก
 const RPC_1 = process.env.RPC_PRIMARY || process.env.ALCHEMY_RPC_URL || process.env.RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY';
 const RPC_2 = process.env.RPC_SECONDARY || process.env.RPC_URL || 'https://mainnet.base.org';
 const RPC_3 = process.env.RPC_TERTIARY || 'https://base.llamarpc.com';
 const RPC_4 = process.env.PUBLIC_NODE_RPC || 'https://base.publicnode.com';
 
-// กำหนด staticNetwork: 8453 ที่ตัว Provider โดยตรง เพื่อลด latency การเช็ก chainId
 const provider1 = new ethers.JsonRpcProvider(RPC_1, 8453, { staticNetwork: true });
 const provider2 = new ethers.JsonRpcProvider(RPC_2, 8453, { staticNetwork: true });
 const provider3 = new ethers.JsonRpcProvider(RPC_3, 8453, { staticNetwork: true });
 const provider4 = new ethers.JsonRpcProvider(RPC_4, 8453, { staticNetwork: true });
 
-// พารามิเตอร์ตัวที่ 2 ต้องเป็น Quorum = 1
 const fallbackProvider = new ethers.FallbackProvider([
     { provider: provider1, priority: 1, weight: 2 },
     { provider: provider2, priority: 2, weight: 1 },
@@ -116,9 +113,10 @@ app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors());
 
+// ขยาย Rate Limit ให้สูงขึ้น ป้องกันบอท OpenSea ชนเพดานโดนบล็อก
 const apiLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
-    max: 150,
+    max: 2000,
     message: { error: "Rate limit exceeded. Please try again later." }
 });
 app.use('/metadata', apiLimiter);
@@ -127,9 +125,8 @@ app.use('/metadata', apiLimiter);
 // CORE ENDPOINT
 // ---------------------------------------------------------
 app.get('/metadata/:tokenId', async (req: Request, res: Response) => {
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
+    // ✅ เปิดให้ Caching Proxy ของ OpenSea บันทึกข้อมูลได้ ไม่สั่ง no-store อีกต่อไป
+    res.setHeader('Cache-Control', 'public, max-age=3600');
 
     const tokenId = req.params.tokenId.replace(/\.json$/, '');
 
