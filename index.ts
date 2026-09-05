@@ -10,20 +10,28 @@ import https from 'https';
 dotenv.config();
 
 // ---------------------------------------------------------
-// [STRATEGY 1]: MULTI-RPC FALLBACK (ระบบสำรอง 4-Node)
+// [STRATEGY 1]: MULTI-RPC FALLBACK (แก้ไข Quorum = 1 และฝัง ChainId 8453 ให้ถูกตำแหน่ง)
 // ---------------------------------------------------------
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0x920c1f00EF178B3C060BD39a6a3f449BA2b230C9';
 
-const RPC_1 = process.env.RPC_PRIMARY || process.env.RPC_URL || process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY';
-const RPC_2 = process.env.RPC_SECONDARY || 'https://mainnet.base.org';
+// ลำดับ RPC: ดึง Alchemy ขึ้นเป็น Priority หลัก
+const RPC_1 = process.env.RPC_PRIMARY || process.env.ALCHEMY_RPC_URL || process.env.RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY';
+const RPC_2 = process.env.RPC_SECONDARY || process.env.RPC_URL || 'https://mainnet.base.org';
 const RPC_3 = process.env.RPC_TERTIARY || 'https://base.llamarpc.com';
 const RPC_4 = process.env.PUBLIC_NODE_RPC || 'https://base.publicnode.com';
 
+// กำหนด staticNetwork: 8453 ที่ตัว Provider โดยตรง เพื่อลด latency การเช็ก chainId
+const provider1 = new ethers.JsonRpcProvider(RPC_1, 8453, { staticNetwork: true });
+const provider2 = new ethers.JsonRpcProvider(RPC_2, 8453, { staticNetwork: true });
+const provider3 = new ethers.JsonRpcProvider(RPC_3, 8453, { staticNetwork: true });
+const provider4 = new ethers.JsonRpcProvider(RPC_4, 8453, { staticNetwork: true });
+
+// พารามิเตอร์ตัวที่ 2 ต้องเป็น Quorum = 1
 const fallbackProvider = new ethers.FallbackProvider([
-    { provider: new ethers.JsonRpcProvider(RPC_1), priority: 1, weight: 2 },
-    { provider: new ethers.JsonRpcProvider(RPC_2), priority: 2, weight: 1 },
-    { provider: new ethers.JsonRpcProvider(RPC_3), priority: 3, weight: 1 },
-    { provider: new ethers.JsonRpcProvider(RPC_4), priority: 4, weight: 1 }
+    { provider: provider1, priority: 1, weight: 2 },
+    { provider: provider2, priority: 2, weight: 1 },
+    { provider: provider3, priority: 3, weight: 1 },
+    { provider: provider4, priority: 4, weight: 1 }
 ], 1);
 
 const abi = [
@@ -32,24 +40,32 @@ const abi = [
 const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, fallbackProvider);
 
 // ---------------------------------------------------------
-// [STRATEGY 2]: SECURE AXIOS ENGINE & IRYS ID PARSER
+// [STRATEGY 2]: SECURE AXIOS ENGINE & SMART UNPACKER
 // ---------------------------------------------------------
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 const secureAxios = axios.create({
-    timeout: 4000,
+    timeout: 5000,
     maxContentLength: 50000,
+    maxBodyLength: 50000,
     httpAgent,
     httpsAgent,
-    maxRedirects: 0,
-    headers: { 'Accept': 'application/json' }
+    maxRedirects: 3,
+    headers: { 'Accept': 'application/json, text/plain, */*' }
 });
 
 const isSafeDomain = (url: string): boolean => {
     try {
         const parsedUrl = new URL(url);
-        const allowedDomains = ['arweave.net', 'ipfs.io', 'gateway.irys.xyz', 'gateway.pinata.cloud'];
+        const allowedDomains = [
+            'arweave.net', 
+            'ipfs.io', 
+            'gateway.irys.xyz', 
+            'gateway.pinata.cloud',
+            'cloudflare-ipfs.com',
+            'dweb.link'
+        ];
         return allowedDomains.some(domain => 
             parsedUrl.hostname === domain || parsedUrl.hostname.endsWith(`.${domain}`)
         );
@@ -58,7 +74,6 @@ const isSafeDomain = (url: string): boolean => {
     }
 };
 
-// [SYSTEM CORRECTION]: แก้ไขตัวแปลง URI ให้รองรับทั้ง Full URL, Protocols และ Irys Tx ID เพียวๆ
 const formatURI = (uri: string): string => {
     if (!uri) return "";
     const cleanUri = uri.trim();
@@ -67,8 +82,29 @@ const formatURI = (uri: string): string => {
     if (cleanUri.startsWith("ipfs://")) return cleanUri.replace("ipfs://", "https://gateway.pinata.cloud/ipfs/");
     if (cleanUri.startsWith("http://") || cleanUri.startsWith("https://")) return cleanUri;
 
-    // ถ้าส่งมาเป็นแค่ Tx ID เพียวๆ ของ Irys ให้ต่อ URL Gateway ให้อัตโนมัติ
     return `https://gateway.irys.xyz/${cleanUri}`;
+};
+
+const fetchJsonMetadata = async (url: string) => {
+    try {
+        const response = await secureAxios.get(url, { responseType: 'text' });
+        let data = response.data;
+
+        if (typeof data === 'string') {
+            try {
+                data = JSON.parse(data);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            return data;
+        }
+    } catch (error: any) {
+        // Ignore non-json or oversized payload
+    }
+    return null; 
 };
 
 // ---------------------------------------------------------
@@ -77,7 +113,6 @@ const formatURI = (uri: string): string => {
 const app = express();
 
 app.set('trust proxy', 1); 
-
 app.use(express.json());
 app.use(cors());
 
@@ -96,7 +131,6 @@ app.get('/metadata/:tokenId', async (req: Request, res: Response) => {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
-    // ดักตัด .json ออกให้เหลือแต่ตัวเลข Token ID
     const tokenId = req.params.tokenId.replace(/\.json$/, '');
 
     if (!/^\d+$/.test(tokenId)) {
@@ -110,42 +144,69 @@ app.get('/metadata/:tokenId', async (req: Request, res: Response) => {
             return res.status(404).json({ error: "โฉนดใบนี้ยังไม่ถูกสร้างเข้าระบบสิทธิ์ขาด" });
         }
 
-        const metadata: Record<string, any> = {
-            name: `Imperial Sovereign Deed #${tokenId}`,
-            description: "The Absolute Proof of True Ownership & Identity.",
-            image: formatURI(data.front),
-            external_url: `https://basescan.org/token/${CONTRACT_ADDRESS}?a=${tokenId}`,
-            attributes: [
-                { trait_type: "Sovereign Owner", value: data.owner },
-                { trait_type: "Active Status", value: data.active ? "True" : "False" },
-                { trait_type: "Sanctified", value: data.sanctified ? "True" : "False" }
-            ]
-        };
+        const rawFrontUrl = formatURI(data.front);
+        let finalImage = rawFrontUrl; 
+        let finalAnimation = data.video ? formatURI(data.video) : undefined;
+        let finalName = `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`;
+        let finalDescription = "IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest";
+        const dynamicAttributes: any[] = [
+            { trait_type: "Sovereign Owner", value: data.owner },
+            { trait_type: "Active Status", value: data.active ? "True" : "False" },
+            { trait_type: "Sanctified", value: data.sanctified ? "True" : "False" }
+        ];
 
-        if (data.video && data.video.trim() !== "") metadata.animation_url = formatURI(data.video);
-        if (data.back && data.back.trim() !== "") metadata.attributes.push({ trait_type: "Deed Back Registry", value: formatURI(data.back) });
-        if (data.dna && data.dna.trim() !== "") metadata.attributes.push({ trait_type: "Identity DNA (Forensic Anchor)", value: data.dna });
+        if (data.front && data.front.trim() !== "") {
+            const frontJson = await fetchJsonMetadata(rawFrontUrl);
+            if (frontJson) {
+                if (frontJson.image) finalImage = formatURI(frontJson.image);
+                if (frontJson.animation_url) finalAnimation = formatURI(frontJson.animation_url);
+                if (frontJson.name) finalName = frontJson.name;
+                if (frontJson.description) finalDescription = frontJson.description;
+                if (frontJson.attributes && Array.isArray(frontJson.attributes)) {
+                    dynamicAttributes.push(...frontJson.attributes);
+                }
+            }
+        }
+
+        if (data.back && data.back.trim() !== "") {
+            const fullBackUrl = formatURI(data.back);
+            dynamicAttributes.push({ trait_type: "Deed Back Registry", value: fullBackUrl });
+            
+            if (!finalAnimation) {
+                finalAnimation = fullBackUrl;
+            }
+        }
 
         if (data.hidden && data.hidden.trim() !== "") {
             const hiddenUrl = formatURI(data.hidden);
-            
             if (hiddenUrl.startsWith("http") && isSafeDomain(hiddenUrl)) {
-                try {
-                    const response = await secureAxios.get(hiddenUrl);
-                    const extraData = response.data;
-                    
-                    if (extraData && Array.isArray(extraData.attributes)) {
-                        metadata.attributes.push(...extraData.attributes);
-                    } else if (extraData && typeof extraData === 'object') {
-                        metadata.attributes.push({ trait_type: "Hidden Property (Chrono-Map)", value: JSON.stringify(extraData) });
+                const hiddenJson = await fetchJsonMetadata(hiddenUrl);
+                if (hiddenJson) {
+                    if (Array.isArray(hiddenJson.attributes)) {
+                        dynamicAttributes.push(...hiddenJson.attributes);
+                    } else {
+                        dynamicAttributes.push({ trait_type: "Hidden Property (Chrono-Map)", value: JSON.stringify(hiddenJson) });
                     }
-                } catch (err: any) {
-                    console.warn(`[WARN] ⚠️ ดึงข้อมูล Hidden จาก ${hiddenUrl} ไม่สำเร็จ: ${err.message}`);
-                    metadata.attributes.push({ trait_type: "Hidden Property (Chrono-Map)", value: hiddenUrl });
+                } else {
+                    dynamicAttributes.push({ trait_type: "Hidden Property (Chrono-Map)", value: hiddenUrl });
                 }
-            } else {
-                metadata.attributes.push({ trait_type: "Hidden Property (Chrono-Map)", value: data.hidden });
             }
+        }
+
+        if (data.dna && data.dna.trim() !== "") {
+            dynamicAttributes.push({ trait_type: "Identity DNA", value: data.dna });
+        }
+
+        const metadata: Record<string, any> = {
+            name: finalName,
+            description: finalDescription,
+            image: finalImage,
+            external_url: `https://basescan.org/token/${CONTRACT_ADDRESS}?a=${tokenId}`,
+            attributes: dynamicAttributes
+        };
+
+        if (finalAnimation) {
+            metadata.animation_url = finalAnimation;
         }
 
         res.json(metadata);
@@ -156,7 +217,7 @@ app.get('/metadata/:tokenId', async (req: Request, res: Response) => {
             return res.status(404).json({ error: `Token #${tokenId} does not exist.` });
         }
         console.error(`[ORACLE ERROR] ⚠️ Token #${tokenId}:`, error.message || error);
-        res.status(500).json({ error: "Internal Server / RPC Connection Error" });
+        res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
