@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/metadata/:tokenId",
+      "destination": "/api/index.js"
+    }
+  ]
+}
