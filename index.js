@@ -7,10 +7,10 @@ const app = express();
 app.use(cors());
 
 // =====================================================
-// ⚙️ CONFIGURATION (ENVIRONMENT SECURED)
+// ⚙️ CONFIGURATION (HARDCODED DIRECTLY)
 // =====================================================
-const PORT = process.env.PORT || 3000;
-const RPC_URL = process.env.RPC_URL || "https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl"; 
+const PORT = 3000;
+const RPC_URL = "https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl"; 
 const CONTRACT_ADDRESS = "0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2";
 const BURNED_IMAGE_TXID = "https://gateway.irys.xyz/YOUR_BURNED_IMAGE_ID"; 
 
@@ -70,7 +70,6 @@ const detectAndFetchMedia = async (txId) => {
                 return { type: 'image', url };
             }
             
-            // บังคับ Reject ถ้า Gateway ส่งขยะหรือ HTML 200 OK กลับมา
             throw new Error(`Invalid media payload from ${url}`);
         }
     };
@@ -139,7 +138,7 @@ app.get('/metadata/:tokenId', async (req, res) => {
 
         let externalLinks = [];
 
-        // 🟢 แกะ JSON และเจาะดึง URL รูปภาพข้างใน
+        // 🟢 แกะ JSON ชั้นในเพื่อดึง URL รูปภาพ
         parsedMedia.forEach((media, index) => {
             if (!media) return;
             const originField = index === 0 ? "Front" : index === 1 ? "Back" : "Extra";
@@ -147,8 +146,13 @@ app.get('/metadata/:tokenId', async (req, res) => {
             if (media.type === 'json') {
                 if (media.data.name) finalMetadata.name = media.data.name;
                 if (media.data.description) finalMetadata.description = media.data.description;
-                if (media.data.image) finalMetadata.image = media.data.image.startsWith("http") ? media.data.image : `https://gateway.irys.xyz/${media.data.image}`;
-                if (media.data.attributes) {
+                
+                // ดึง URL รูปภาพจาก Key "image" ด้านใน JSON Manifest
+                if (media.data.image) {
+                    finalMetadata.image = media.data.image.startsWith("http") ? media.data.image : `https://gateway.irys.xyz/${media.data.image}`;
+                }
+                
+                if (media.data.attributes && Array.isArray(media.data.attributes)) {
                     const overrideKeys = ["Sanctified (NOVA)", "Raw Identity DNA", "Sovereign Identity", "Identity ID", "Forensic Pixel Coordinates", "Chrono-Map Anchor", "Back Deed"];
                     finalMetadata.attributes = finalMetadata.attributes.concat(
                         media.data.attributes.filter(attr => !overrideKeys.includes(attr.trait_type))
@@ -176,19 +180,32 @@ app.get('/metadata/:tokenId', async (req, res) => {
 
         finalMetadata.attributes.push({ trait_type: "Sanctified (NOVA)", value: isSanctified ? "TRUE" : "FALSE" });
         
-        // ⚡ REGEX DNA PARSER (แกะแพทเทิร์นข้าม Spacebar สับแยก Traits อัตโนมัติ)
+        // ⚡ UNIVERSAL DNA PARSER (รองรับทั้งแบบคั่นด้วย | และแบบช่องว่างเคาะ spacebar)
         if (dnaString && dnaString !== "UNASSIGNED" && dnaString.trim()) {
             finalMetadata.attributes.push({ trait_type: "Raw Identity DNA", value: dnaString });
             
-            const regex = /([A-Z0-9_-]+)\s*:\s*(\S+)/g;
-            let match;
-            
-            while ((match = regex.exec(dnaString)) !== null) {
-                let rawKey = match[1].trim();
-                let val = match[2].trim();
-                let dynamicKey = rawKey.replace(/[-_]/g, ' ').replace(/\w\S*/g, txt => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
-                
-                finalMetadata.attributes.push({ trait_type: dynamicKey, value: val });
+            if (dnaString.includes('|')) {
+                // กรณีเป็น Format เดิม: KEY:VAL|KEY:VAL
+                const dnaSegments = dnaString.split('|').map(s => s.trim()).filter(Boolean);
+                dnaSegments.forEach(segment => {
+                    const colonIndex = segment.indexOf(':');
+                    if (colonIndex !== -1) {
+                        let rawKey = segment.substring(0, colonIndex).trim();
+                        const val = segment.substring(colonIndex + 1).trim();
+                        let dynamicKey = rawKey.replace(/[-_]/g, ' ').replace(/\w\S*/g, txt => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
+                        finalMetadata.attributes.push({ trait_type: dynamicKey, value: val });
+                    }
+                });
+            } else {
+                // กรณีเป็น Format ใหม่: KEY:VAL KEY : VAL
+                const regex = /([A-Z0-9_-]+)\s*:\s*(\S+)/g;
+                let match;
+                while ((match = regex.exec(dnaString)) !== null) {
+                    let rawKey = match[1].trim();
+                    let val = match[2].trim();
+                    let dynamicKey = rawKey.replace(/[-_]/g, ' ').replace(/\w\S*/g, txt => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
+                    finalMetadata.attributes.push({ trait_type: dynamicKey, value: val });
+                }
             }
         }
 
