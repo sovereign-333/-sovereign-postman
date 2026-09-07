@@ -1,3 +1,88 @@
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { ethers } = require('ethers');
+
+const app = express();
+app.use(cors());
+
+// =====================================================
+// ⚙️ CONFIGURATION (ENVIRONMENT SECURED)
+// =====================================================
+const PORT = process.env.PORT || 3000;
+const RPC_URL = process.env.RPC_URL || "https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl"; 
+const CONTRACT_ADDRESS = "0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2";
+const BURNED_IMAGE_TXID = "https://gateway.irys.xyz/YOUR_BURNED_IMAGE_ID"; 
+
+// =====================================================
+// ⚡ INITIALIZE ON-CHAIN CONTRACT
+// =====================================================
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const abi = [
+    "function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string front, string back, string video, string dna, string hidden)"
+];
+const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, provider);
+
+// =====================================================
+// 🛠️ DYNAMIC MEDIA DETECTOR (CONCURRENT ENGINE)
+// =====================================================
+const detectAndFetchMedia = async (txId) => {
+    if (!txId || txId === "UNASSIGNED" || !txId.trim()) return null;
+
+    let urlsToTry = [];
+    
+    if (txId.startsWith("ipfs://")) {
+        const ipfsHash = txId.replace("ipfs://", "");
+        urlsToTry.push(`https://ipfs.io/ipfs/${ipfsHash}`);
+        urlsToTry.push(`https://cloudflare-ipfs.com/ipfs/${ipfsHash}`); 
+    } else if (!txId.startsWith("http")) {
+        urlsToTry.push(`https://gateway.irys.xyz/${txId}`);
+        urlsToTry.push(`https://arweave.net/${txId}`);
+    } else {
+        urlsToTry.push(txId);
+    }
+
+    const fetchFromGateway = async (url) => {
+        let contentType = '';
+        try {
+            const headRes = await axios.head(url, { timeout: 1800 });
+            contentType = (headRes.headers['content-type'] || '').toLowerCase();
+        } catch (headErr) {
+            // Gateway บล็อก HEAD ให้ปล่อยผ่านไปเช็ค GET
+        }
+
+        if (contentType.includes('json')) {
+            const getRes = await axios.get(url, { timeout: 1800, maxContentLength: 5000000 });
+            return { type: 'json', data: getRes.data, url };
+        } else if (contentType.includes('video') || contentType.includes('mp4')) {
+            return { type: 'video', url };
+        } else if (contentType.includes('image')) {
+            return { type: 'image', url };
+        } else {
+            const getRes = await axios.get(url, { timeout: 1800, maxContentLength: 5000000 });
+            const fetchedType = (getRes.headers['content-type'] || '').toLowerCase();
+            
+            if (typeof getRes.data === 'object') {
+                return { type: 'json', data: getRes.data, url };
+            } else if (fetchedType.includes('video') || fetchedType.includes('mp4')) {
+                return { type: 'video', url };
+            } else if (fetchedType.includes('image')) {
+                return { type: 'image', url };
+            }
+            
+            // บังคับ Reject ถ้า Gateway ส่งขยะหรือ HTML 200 OK กลับมา
+            throw new Error(`Invalid media payload from ${url}`);
+        }
+    };
+
+    try {
+        return await Promise.any(urlsToTry.map(url => fetchFromGateway(url)));
+    } catch (aggregateError) {
+        console.warn(`[Gateway Failure] All nodes failed for TXID: ${txId}`);
+        return null;
+    }
+};
+
 // =====================================================
 // 🚀 MAIN METADATA ENDPOINT (VERCEL EDGE CACHED)
 // =====================================================
@@ -54,7 +139,7 @@ app.get('/metadata/:tokenId', async (req, res) => {
 
         let externalLinks = [];
 
-        // 🟢 ตรรกะแกะ JSON และดึง URL รูปภาพ (ทำงานตามรูป 1000078435.jpg 100%)
+        // 🟢 แกะ JSON และเจาะดึง URL รูปภาพข้างใน
         parsedMedia.forEach((media, index) => {
             if (!media) return;
             const originField = index === 0 ? "Front" : index === 1 ? "Back" : "Extra";
@@ -62,7 +147,6 @@ app.get('/metadata/:tokenId', async (req, res) => {
             if (media.type === 'json') {
                 if (media.data.name) finalMetadata.name = media.data.name;
                 if (media.data.description) finalMetadata.description = media.data.description;
-                // เจาะทะลวงดึง TXID รูปภาพที่ซ่อนอยู่ใน JSON
                 if (media.data.image) finalMetadata.image = media.data.image.startsWith("http") ? media.data.image : `https://gateway.irys.xyz/${media.data.image}`;
                 if (media.data.attributes) {
                     const overrideKeys = ["Sanctified (NOVA)", "Raw Identity DNA", "Sovereign Identity", "Identity ID", "Forensic Pixel Coordinates", "Chrono-Map Anchor", "Back Deed"];
@@ -92,20 +176,16 @@ app.get('/metadata/:tokenId', async (req, res) => {
 
         finalMetadata.attributes.push({ trait_type: "Sanctified (NOVA)", value: isSanctified ? "TRUE" : "FALSE" });
         
-        // ⚡ ตรรกะใหม่: แกะ DNA String ด้วย Regex สแกนข้าม Spacebar
-        // ตัวอย่างเป้าหมาย: IDENTITY_DNA:SAKSIT  PIXEL :X=1014,Y=1754 CHRONO-MAP:12S:FR1-5
+        // ⚡ REGEX DNA PARSER (แกะแพทเทิร์นข้าม Spacebar สับแยก Traits อัตโนมัติ)
         if (dnaString && dnaString !== "UNASSIGNED" && dnaString.trim()) {
             finalMetadata.attributes.push({ trait_type: "Raw Identity DNA", value: dnaString });
             
-            // Regex: ดึงตัวอักษรพิมพ์ใหญ่/ขีด (Key) ตามด้วยช่องว่าง(ถ้ามี) โคลอน ช่องว่าง(ถ้ามี) และข้อมูล (Value)
             const regex = /([A-Z0-9_-]+)\s*:\s*(\S+)/g;
             let match;
             
             while ((match = regex.exec(dnaString)) !== null) {
-                let rawKey = match[1].trim(); // เช่น IDENTITY_DNA, PIXEL, CHRONO-MAP
-                let val = match[2].trim();    // เช่น SAKSIT, X=1014,Y=1754, 12S:FR1-5
-                
-                // จัด Format Key ให้ดูดีบน OpenSea (เช่น IDENTITY_DNA -> Identity Dna)
+                let rawKey = match[1].trim();
+                let val = match[2].trim();
                 let dynamicKey = rawKey.replace(/[-_]/g, ' ').replace(/\w\S*/g, txt => txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase());
                 
                 finalMetadata.attributes.push({ trait_type: dynamicKey, value: val });
@@ -128,3 +208,14 @@ app.get('/metadata/:tokenId', async (req, res) => {
         });
     }
 });
+
+// =====================================================
+// 🟢 UNIVERSAL SERVER BINDING
+// =====================================================
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`Imperial Metadata API listening on port ${PORT}`);
+    });
+}
+
+module.exports = app;
