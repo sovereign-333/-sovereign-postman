@@ -1,13 +1,14 @@
-import express, { Request, Response, NextFunction } from 'express';
-import { Contract, JsonRpcProvider } from 'ethers';
+import express, { Request, Response } from 'express';
+import { Contract, JsonRpcProvider, ZeroAddress } from 'ethers';
 import cors from 'cors';
 import helmet from 'helmet';
 
 // ============================================================================
-// 🔱 CONSTANTS & ENVIRONMENT CONFIGURATION
+// 🔱 CONSTANTS & INFRASTRUCTURE TARGETS
 // ============================================================================
 const CONTRACT_ADDRESS = '0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2';
 const FALLBACK_IMAGE_URL = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
+const MAX_SUPPLY = 333;
 
 const RPC_ENDPOINTS: string[] = [
   process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl',
@@ -23,6 +24,8 @@ const CONTRACT_ABI: string[] = [
   'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)',
   'function getTBA(uint256 t) external view returns (address)'
 ];
+
+const memoryCache = new Map<string, InterrogatedResource>();
 
 // ============================================================================
 // 🛡️ TYPE DEFINITIONS
@@ -41,25 +44,20 @@ interface ERC721Metadata {
   attributes: Attribute[];
 }
 
-interface NormalizedUri {
-  url: string;
-  txId: string | null;
-}
-
 interface OnChainDeed {
   owner: string;
   active: boolean;
   sanctified: boolean;
-  front: NormalizedUri;
-  back: NormalizedUri;
-  video: NormalizedUri;
+  front: string;
+  back: string;
+  video: string;
   dna: string;
-  hidden: NormalizedUri;
+  hidden: string;
   tbaAddress: string;
 }
 
-interface ResourceResult {
-  type: 'json' | 'image' | 'video' | 'none';
+interface InterrogatedResource {
+  type: 'json' | 'image' | 'video' | 'unknown';
   payload?: any;
 }
 
@@ -71,7 +69,7 @@ const FALLBACK_METADATA: ERC721Metadata = {
 };
 
 const STANDARD_FETCH_HEADERS: Record<string, string> = {
-  'User-Agent': 'Imperial-Protocol-Engine/1.0 (Vercel-Serverless-Production)',
+  'User-Agent': 'Imperial-Protocol-Engine/1.0 (Serverless-Production)',
   'Accept': 'application/json, image/*, video/*, */*'
 };
 
@@ -79,34 +77,26 @@ const STANDARD_FETCH_HEADERS: Record<string, string> = {
 // ⚙️ HARDENED UTILITIES & PARSERS
 // ============================================================================
 
-function parseRawUri(rawUri: string | null | undefined): NormalizedUri {
-  if (!rawUri) return { url: '', txId: null };
+function parseRawUri(rawUri: string | null | undefined): string {
+  if (!rawUri) return '';
   const trimmed = rawUri.trim();
-  if (!trimmed || trimmed.toUpperCase() === 'UNASSIGNED') return { url: '', txId: null };
-
-  let txId: string | null = null;
-  let url = trimmed;
+  if (!trimmed) return '';
 
   if (trimmed.length >= 43 && !trimmed.includes('://') && !trimmed.includes('/')) {
-    txId = trimmed;
-    url = `https://gateway.irys.xyz/${trimmed}`;
-  } else if (trimmed.includes('gateway.irys.xyz/')) {
-    txId = trimmed.split('gateway.irys.xyz/')[1]?.split('?')[0] || null;
-  } else if (trimmed.includes('arweave.net/')) {
-    txId = trimmed.split('arweave.net/')[1]?.split('?')[0] || null;
-  } else if (trimmed.startsWith('ar://')) {
-    txId = trimmed.replace('ar://', '');
-    url = `https://arweave.net/${txId}`;
-  } else if (trimmed.startsWith('ipfs://')) {
-    url = `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
+    return `https://gateway.irys.xyz/${trimmed}`;
   }
-
-  return { url, txId };
+  if (trimmed.startsWith('ar://')) {
+    return `https://arweave.net/${trimmed.replace('ar://', '')}`;
+  }
+  if (trimmed.startsWith('ipfs://')) {
+    return `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
+  }
+  return trimmed;
 }
 
 function parseDnaAttributes(dnaStr: string | null | undefined): Attribute[] {
   const attributes: Attribute[] = [];
-  if (!dnaStr || typeof dnaStr !== 'string' || dnaStr.toUpperCase() === 'UNASSIGNED') return attributes;
+  if (!dnaStr || typeof dnaStr !== 'string') return attributes;
 
   const cleanDna = dnaStr.includes('STRINGS MEMORY DNA :')
     ? dnaStr.split('STRINGS MEMORY DNA :')[1]
@@ -132,63 +122,64 @@ function parseDnaAttributes(dnaStr: string | null | undefined): Attribute[] {
   return attributes;
 }
 
-async function fetchResourceOrType(uriData: NormalizedUri): Promise<ResourceResult> {
-  if (!uriData.url) return { type: 'none' };
+async function interrogateResource(url: string): Promise<InterrogatedResource> {
+  if (!url) return { type: 'unknown' };
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2500);
+  if (memoryCache.has(url)) {
+    return memoryCache.get(url)!;
+  }
 
   try {
-    const fetchUrl = uriData.txId ? `https://gateway.irys.xyz/${uriData.txId}` : uriData.url;
-    const response = await fetch(fetchUrl, {
+    const response = await fetch(url, {
       headers: STANDARD_FETCH_HEADERS,
-      signal: controller.signal
+      signal: AbortSignal.timeout(3000)
     });
 
-    if (!response.ok) return { type: 'none' };
+    if (!response.ok) return { type: 'unknown' };
 
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    let result: InterrogatedResource = { type: 'unknown' };
 
-    if (contentType.includes('json') || fetchUrl.endsWith('.json')) {
-      const payload = await response.json();
-      return { type: 'json', payload };
-    }
-    if (contentType.includes('video') || fetchUrl.match(/\.(mp4|webm|mov)$/i)) {
-      return { type: 'video' };
-    }
-    if (contentType.includes('image') || fetchUrl.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i)) {
-      return { type: 'image' };
+    // 🛡️ ZERO-GUESSWORK: บังคับลอง Parse JSON เสมอเพื่อแก้ปัญหา Irys Octet-stream
+    if (!contentType.includes('image') && !contentType.includes('video')) {
+      try {
+        const clone = response.clone();
+        const payload = await clone.json();
+        result = { type: 'json', payload };
+      } catch {
+        // ไม่ใช่ JSON ปล่อยผ่านไปเช็คเงื่อนไขอื่น
+      }
     }
 
-    return { type: 'none' };
+    if (result.type === 'unknown') {
+      if (contentType.includes('video') || url.match(/\.(mp4|webm|mov)$/i)) {
+        result = { type: 'video' };
+      } else if (contentType.includes('image') || url.match(/\.(png|jpg|jpeg|gif|webp|svg)$/i)) {
+        result = { type: 'image' };
+      }
+    }
+
+    if (result.type !== 'unknown') {
+      memoryCache.set(url, result);
+    }
+
+    return result;
   } catch {
-    return { type: 'none' };
-  } finally {
-    clearTimeout(timeoutId);
+    return { type: 'unknown' };
   }
 }
 
-// ============================================================================
-// 🛡️ CONTRACT READ WITH RPC FAILOVER & TIMEOUT (PARALLEL EXECUTION)
-// ============================================================================
-async function executeContractReadWithRetry(tokenId: bigint): Promise<OnChainDeed> {
-  let lastError: Error | null = null;
-
+async function fetchOnChainStateWithFailover(tokenId: bigint): Promise<OnChainDeed | null> {
   for (const provider of PROVIDERS) {
-    let timeoutId: NodeJS.Timeout | undefined;
     try {
       const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
       
-      const callPromise = Promise.all([
+      // 🛡️ HARDENED: ใช้ Promise.all โดยไม่มี Race Timeout ที่ทำให้เกิด Memory Leak
+      // ปล่อยให้ Ethers.js จัดการ Timeout ตามมาตรฐานของมันเอง
+      const [rawData, tbaAddress]: any = await Promise.all([
         contract.getDeedData(tokenId),
         contract.getTBA(tokenId)
       ]);
-      
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error('RPC Provider Timeout')), 2000);
-      });
-
-      const [rawData, tbaAddress]: any = await Promise.race([callPromise, timeoutPromise]);
 
       return {
         owner: String(rawData[0]),
@@ -199,16 +190,14 @@ async function executeContractReadWithRetry(tokenId: bigint): Promise<OnChainDee
         video: parseRawUri(rawData[5]),
         dna: String(rawData[6] || ''),
         hidden: parseRawUri(rawData[7]),
-        tbaAddress: String(tbaAddress || '0x0000000000000000000000000000000000000000')
+        tbaAddress: String(tbaAddress || ZeroAddress)
       };
-    } catch (err: any) {
-      lastError = err;
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
+    } catch (error) {
+      console.error(`[RPC FAILOVER] Provider failed for Token ${tokenId}`);
+      continue;
     }
   }
-
-  throw lastError || new Error('All RPC endpoints failed execution.');
+  return null;
 }
 
 // ============================================================================
@@ -220,19 +209,28 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<void> => {
-  const { tokenId } = req.params;
-  const numericId = Number(tokenId);
+  // 🛡️ ZERO-DEFECT: สกัดเอาเฉพาะตัวเลข ตัด .json ทิ้งอย่างเด็ดขาด
+  const rawTokenId = req.params.tokenId;
+  const cleanTokenIdStr = rawTokenId.replace(/\.json$/, '');
 
-  if (!/^\d{1,3}$/.test(tokenId) || numericId < 1 || numericId > 333) {
+  // 🛡️ BOUNDARY CHECK: ต้องเป็นตัวเลข และอยู่ระหว่าง 1 ถึง 333 เท่านั้น
+  if (!/^\d+$/.test(cleanTokenIdStr)) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.status(200).json(FALLBACK_METADATA);
+    return;
+  }
+
+  const tokenIdNum = parseInt(cleanTokenIdStr, 10);
+  if (tokenIdNum < 1 || tokenIdNum > MAX_SUPPLY) {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.status(200).json(FALLBACK_METADATA);
     return;
   }
 
   try {
-    const deedData = await executeContractReadWithRetry(BigInt(tokenId));
+    const deedData = await fetchOnChainStateWithFailover(BigInt(tokenIdNum));
 
-    if (!deedData.active) {
+    if (!deedData || !deedData.active) {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.status(200).json(FALLBACK_METADATA);
       return;
@@ -240,110 +238,64 @@ app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<v
 
     res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
 
-    let finalAttributes: Attribute[] = [];
-    let finalImage = FALLBACK_IMAGE_URL;
-    let animationUrl = deedData.video.url;
-    let externalJsonPayload: any = null;
-    let directImage = '';
-
-    // ------------------------------------------------------------------------
-    // 🛡️ ABSTRACT GOVERNANCE & SILENT POWER MAPPING (REGULATORY SAFE)
-    // ------------------------------------------------------------------------
-    const isCouncil = (numericId >= 1 && numericId <= 10) || numericId === 50 || numericId === 100;
-    const isTierZero = numericId >= 1 && numericId <= 10;
-    const isInherentlySanctified = isCouncil || numericId === 333;
-    
-    const finalSanctifiedState = deedData.sanctified || isInherentlySanctified;
-
-    if (isCouncil) {
-      finalAttributes.push({ trait_type: 'Council Status', value: 'Active Council' });
-    }
-    
-    // Abstract Power Injection (No Financial Terms)
-    if (isTierZero) {
-      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'TIER-0' });
-      finalAttributes.push({ trait_type: 'COUNCIL PRIVILEGE', value: 'FULL INTEGRITY' });
-    } else if (numericId === 50 || numericId === 100) {
-      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'TIER-1' });
-      finalAttributes.push({ trait_type: 'COUNCIL PRIVILEGE', value: 'GOVERNANCE ONLY' });
-    } else {
-      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'STANDARD' });
-    }
-
-    if (deedData.tbaAddress && deedData.tbaAddress !== '0x0000000000000000000000000000000000000000') {
-      finalAttributes.push({ trait_type: 'Token Bound Account (TBA)', value: deedData.tbaAddress });
-    }
-
-    // ------------------------------------------------------------------------
-    // MEDIA & JSON RESOLUTION PIPELINE
-    // ------------------------------------------------------------------------
-    const [frontRes, backRes] = await Promise.all([
-      fetchResourceOrType(deedData.front),
-      fetchResourceOrType(deedData.back)
+    const [frontInfo, backInfo] = await Promise.all([
+      interrogateResource(deedData.front),
+      interrogateResource(deedData.back)
     ]);
 
-    if (frontRes.type === 'json') externalJsonPayload = frontRes.payload;
-    else if (backRes.type === 'json') externalJsonPayload = backRes.payload;
+    let staticPayload: any = null;
+    if (frontInfo.type === 'json') staticPayload = frontInfo.payload;
+    else if (backInfo.type === 'json') staticPayload = backInfo.payload;
 
-    if (!animationUrl) {
-      if (backRes.type === 'video') animationUrl = deedData.back.url;
-      else if (frontRes.type === 'video') animationUrl = deedData.front.url;
-    }
-
-    if (frontRes.type === 'image') directImage = deedData.front.url;
-    else if (backRes.type === 'image') directImage = deedData.back.url;
-
-    // ------------------------------------------------------------------------
-    // ATTRIBUTE ASSEMBLY & DEDUPLICATION
-    // ------------------------------------------------------------------------
     const traitMap = new Map<string, any>();
-    
-    finalAttributes.forEach(attr => traitMap.set(attr.trait_type, attr.value));
 
-    if (externalJsonPayload && Array.isArray(externalJsonPayload.attributes)) {
-      externalJsonPayload.attributes.forEach((attr: Attribute) => {
-        // Filter out any accidental financial terms from external JSON just in case
-        const safeTrait = attr.trait_type.toUpperCase();
-        if (!safeTrait.includes('DIVIDEND') && !safeTrait.includes('REVENUE') && !safeTrait.includes('YIELD')) {
-          if (!traitMap.has(attr.trait_type)) {
-            traitMap.set(attr.trait_type, attr.value);
-          }
+    if (staticPayload && Array.isArray(staticPayload.attributes)) {
+      staticPayload.attributes.forEach((attr: Attribute) => {
+        if (attr?.trait_type && attr?.value !== undefined) {
+          traitMap.set(attr.trait_type, attr.value);
         }
       });
-      if (externalJsonPayload.image) finalImage = parseRawUri(externalJsonPayload.image).url;
-      if (externalJsonPayload.animation_url && !animationUrl) animationUrl = parseRawUri(externalJsonPayload.animation_url).url;
     }
 
-    if (directImage && finalImage === FALLBACK_IMAGE_URL) {
-      finalImage = directImage;
+    if (deedData.tbaAddress && deedData.tbaAddress !== ZeroAddress) {
+      traitMap.set('Token Bound Account (TBA)', deedData.tbaAddress);
     }
 
-    if (finalSanctifiedState) {
+    if (deedData.sanctified) {
       const dnaAttributes = parseDnaAttributes(deedData.dna);
       dnaAttributes.forEach(attr => traitMap.set(attr.trait_type, attr.value));
       traitMap.set('Sanctified Status', 'TRUE');
     }
 
-    const resolvedAttributes: Attribute[] = Array.from(traitMap, ([trait_type, value]) => ({ trait_type, value }));
+    const finalAttributes: Attribute[] = Array.from(traitMap, ([trait_type, value]) => ({ trait_type, value }));
+
+    let finalImage = parseRawUri(staticPayload?.image);
+    if (!finalImage) {
+      if (frontInfo.type === 'image') finalImage = deedData.front;
+      else if (backInfo.type === 'image') finalImage = deedData.back;
+      else finalImage = FALLBACK_IMAGE_URL;
+    }
+
+    let finalAnimationUrl = parseRawUri(staticPayload?.animation_url);
+    if (!finalAnimationUrl) {
+      if (deedData.video) finalAnimationUrl = deedData.video;
+      else if (backInfo.type === 'video') finalAnimationUrl = deedData.back;
+      else if (frontInfo.type === 'video') finalAnimationUrl = deedData.front;
+    }
 
     const responseMetadata: ERC721Metadata = {
-      name: externalJsonPayload?.name || `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`,
-      description: externalJsonPayload?.description || 'IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest',
+      name: staticPayload?.name || `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenIdNum}`,
+      description: staticPayload?.description || 'IMPERIAL SOVEREIGN ARCHITECTURE',
       image: finalImage,
-      attributes: resolvedAttributes
+      attributes: finalAttributes
     };
 
-    if (animationUrl) responseMetadata.animation_url = animationUrl;
-    if (deedData.hidden.url) {
-      responseMetadata.external_url = deedData.hidden.url;
-    } else if (externalJsonPayload?.external_url) {
-      responseMetadata.external_url = externalJsonPayload.external_url;
-    }
+    if (finalAnimationUrl) responseMetadata.animation_url = finalAnimationUrl;
+    if (deedData.hidden) responseMetadata.external_url = deedData.hidden;
 
     res.status(200).json(responseMetadata);
   } catch (error: any) {
-    console.error(`[EXECUTION ERROR] TokenID ${tokenId}:`, error.message || error);
-    // เปลี่ยนสถานะเป็น 500 เพื่อป้องกัน Marketplace จดจำ Fallback เป็นข้อมูลถาวร
+    console.error(`[EXECUTION ERROR] TokenID ${tokenIdNum}:`, error.message || error);
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.status(500).json({ error: 'TEMPORARY_NETWORK_FAILURE', message: 'RPC Failover Exhausted' });
   }
