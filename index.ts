@@ -20,7 +20,8 @@ const PROVIDERS: JsonRpcProvider[] = RPC_ENDPOINTS.map(
 );
 
 const CONTRACT_ABI: string[] = [
-  'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)'
+  'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)',
+  'function getTBA(uint256 t) external view returns (address)'
 ];
 
 // ============================================================================
@@ -54,6 +55,7 @@ interface OnChainDeed {
   video: NormalizedUri;
   dna: string;
   hidden: NormalizedUri;
+  tbaAddress: string;
 }
 
 interface ResourceResult {
@@ -77,9 +79,6 @@ const STANDARD_FETCH_HEADERS: Record<string, string> = {
 // ⚙️ HARDENED UTILITIES & PARSERS
 // ============================================================================
 
-/**
- * Normalizes any raw URI format (Irys TxID, Arweave Hash, ipfs://, ar://) to canonical gateway HTTPS URL.
- */
 function parseRawUri(rawUri: string | null | undefined): NormalizedUri {
   if (!rawUri) return { url: '', txId: null };
   const trimmed = rawUri.trim();
@@ -105,10 +104,6 @@ function parseRawUri(rawUri: string | null | undefined): NormalizedUri {
   return { url, txId };
 }
 
-/**
- * Line-by-Line DNA String parser for SOVEREIGN NOVA (Sanctified state).
- * Separates dynamic key-values split by pipe '|' and colon ':'.
- */
 function parseDnaAttributes(dnaStr: string | null | undefined): Attribute[] {
   const attributes: Attribute[] = [];
   if (!dnaStr || typeof dnaStr !== 'string' || dnaStr.toUpperCase() === 'UNASSIGNED') return attributes;
@@ -137,9 +132,6 @@ function parseDnaAttributes(dnaStr: string | null | undefined): Attribute[] {
   return attributes;
 }
 
-/**
- * Single-pass Resource Interrogator with strict AbortController timeout.
- */
 async function fetchResourceOrType(uriData: NormalizedUri): Promise<ResourceResult> {
   if (!uriData.url) return { type: 'none' };
 
@@ -177,20 +169,26 @@ async function fetchResourceOrType(uriData: NormalizedUri): Promise<ResourceResu
 }
 
 // ============================================================================
-// 🛡️ CONTRACT READ WITH RPC FAILOVER & TIMEOUT
+// 🛡️ CONTRACT READ WITH RPC FAILOVER & TIMEOUT (PARALLEL EXECUTION)
 // ============================================================================
 async function executeContractReadWithRetry(tokenId: bigint): Promise<OnChainDeed> {
   let lastError: Error | null = null;
 
   for (const provider of PROVIDERS) {
+    let timeoutId: NodeJS.Timeout | undefined;
     try {
       const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
-      const callPromise = contract.getDeedData(tokenId);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('RPC Provider Timeout')), 2000)
-      );
+      
+      const callPromise = Promise.all([
+        contract.getDeedData(tokenId),
+        contract.getTBA(tokenId)
+      ]);
+      
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('RPC Provider Timeout')), 2000);
+      });
 
-      const rawData: any = await Promise.race([callPromise, timeoutPromise]);
+      const [rawData, tbaAddress]: any = await Promise.race([callPromise, timeoutPromise]);
 
       return {
         owner: String(rawData[0]),
@@ -200,10 +198,13 @@ async function executeContractReadWithRetry(tokenId: bigint): Promise<OnChainDee
         back: parseRawUri(rawData[4]),
         video: parseRawUri(rawData[5]),
         dna: String(rawData[6] || ''),
-        hidden: parseRawUri(rawData[7])
+        hidden: parseRawUri(rawData[7]),
+        tbaAddress: String(tbaAddress || '0x0000000000000000000000000000000000000000')
       };
     } catch (err: any) {
       lastError = err;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
@@ -218,18 +219,12 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// Edge Caching Middleware
-app.use((_req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-  next();
-});
-
-// Dynamic Token Metadata Endpoint
 app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<void> => {
   const { tokenId } = req.params;
   const numericId = Number(tokenId);
 
-  if (!/^\d+$/.test(tokenId) || numericId < 1 || numericId > 333) {
+  if (!/^\d{1,3}$/.test(tokenId) || numericId < 1 || numericId > 333) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.status(200).json(FALLBACK_METADATA);
     return;
   }
@@ -238,9 +233,12 @@ app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<v
     const deedData = await executeContractReadWithRetry(BigInt(tokenId));
 
     if (!deedData.active) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.status(200).json(FALLBACK_METADATA);
       return;
     }
+
+    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
 
     let finalAttributes: Attribute[] = [];
     let finalImage = FALLBACK_IMAGE_URL;
@@ -248,69 +246,91 @@ app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<v
     let externalJsonPayload: any = null;
     let directImage = '';
 
-    // Parallel Single-pass Execution for Front and Back URIs
+    // ------------------------------------------------------------------------
+    // 🛡️ ABSTRACT GOVERNANCE & SILENT POWER MAPPING (REGULATORY SAFE)
+    // ------------------------------------------------------------------------
+    const isCouncil = (numericId >= 1 && numericId <= 10) || numericId === 50 || numericId === 100;
+    const isTierZero = numericId >= 1 && numericId <= 10;
+    const isInherentlySanctified = isCouncil || numericId === 333;
+    
+    const finalSanctifiedState = deedData.sanctified || isInherentlySanctified;
+
+    if (isCouncil) {
+      finalAttributes.push({ trait_type: 'Council Status', value: 'Active Council' });
+    }
+    
+    // Abstract Power Injection (No Financial Terms)
+    if (isTierZero) {
+      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'TIER-0' });
+      finalAttributes.push({ trait_type: 'COUNCIL PRIVILEGE', value: 'FULL INTEGRITY' });
+    } else if (numericId === 50 || numericId === 100) {
+      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'TIER-1' });
+      finalAttributes.push({ trait_type: 'COUNCIL PRIVILEGE', value: 'GOVERNANCE ONLY' });
+    } else {
+      finalAttributes.push({ trait_type: 'SOVEREIGN ACCESS', value: 'STANDARD' });
+    }
+
+    if (deedData.tbaAddress && deedData.tbaAddress !== '0x0000000000000000000000000000000000000000') {
+      finalAttributes.push({ trait_type: 'Token Bound Account (TBA)', value: deedData.tbaAddress });
+    }
+
+    // ------------------------------------------------------------------------
+    // MEDIA & JSON RESOLUTION PIPELINE
+    // ------------------------------------------------------------------------
     const [frontRes, backRes] = await Promise.all([
       fetchResourceOrType(deedData.front),
       fetchResourceOrType(deedData.back)
     ]);
 
-    // Resolve JSON Metadata Payload (First Mint Factory Defaults)
     if (frontRes.type === 'json') externalJsonPayload = frontRes.payload;
     else if (backRes.type === 'json') externalJsonPayload = backRes.payload;
 
-    // Resolve Video Streams
     if (!animationUrl) {
       if (backRes.type === 'video') animationUrl = deedData.back.url;
       else if (frontRes.type === 'video') animationUrl = deedData.front.url;
     }
 
-    // Resolve Image Streams
     if (frontRes.type === 'image') directImage = deedData.front.url;
     else if (backRes.type === 'image') directImage = deedData.back.url;
 
     // ------------------------------------------------------------------------
-    // ATTRIBUTE & MEDIA ASSEMBLY PIPELINE
+    // ATTRIBUTE ASSEMBLY & DEDUPLICATION
     // ------------------------------------------------------------------------
-    if (externalJsonPayload) {
-      // Direct pass-through of Factory JSON Attributes (Contains RANK & IDENTITY STATUS)
-      if (Array.isArray(externalJsonPayload.attributes)) {
-        finalAttributes = [...externalJsonPayload.attributes];
-      }
-      if (externalJsonPayload.image) {
-        finalImage = parseRawUri(externalJsonPayload.image).url;
-      }
-      if (externalJsonPayload.animation_url && !animationUrl) {
-        animationUrl = parseRawUri(externalJsonPayload.animation_url).url;
-      }
+    const traitMap = new Map<string, any>();
+    
+    finalAttributes.forEach(attr => traitMap.set(attr.trait_type, attr.value));
+
+    if (externalJsonPayload && Array.isArray(externalJsonPayload.attributes)) {
+      externalJsonPayload.attributes.forEach((attr: Attribute) => {
+        // Filter out any accidental financial terms from external JSON just in case
+        const safeTrait = attr.trait_type.toUpperCase();
+        if (!safeTrait.includes('DIVIDEND') && !safeTrait.includes('REVENUE') && !safeTrait.includes('YIELD')) {
+          if (!traitMap.has(attr.trait_type)) {
+            traitMap.set(attr.trait_type, attr.value);
+          }
+        }
+      });
+      if (externalJsonPayload.image) finalImage = parseRawUri(externalJsonPayload.image).url;
+      if (externalJsonPayload.animation_url && !animationUrl) animationUrl = parseRawUri(externalJsonPayload.animation_url).url;
     }
 
-    // Apply Direct Media if JSON Image is missing or Fallback
     if (directImage && finalImage === FALLBACK_IMAGE_URL) {
       finalImage = directImage;
     }
 
-    // Append Dynamic DNA Attributes only if Sanctified (SOVEREIGN NOVA State)
-    if (deedData.sanctified) {
+    if (finalSanctifiedState) {
       const dnaAttributes = parseDnaAttributes(deedData.dna);
-      const existingTraits = new Set(finalAttributes.map(a => a.trait_type));
-
-      for (const dnaAttr of dnaAttributes) {
-        if (!existingTraits.has(dnaAttr.trait_type)) {
-          finalAttributes.push(dnaAttr);
-        }
-      }
-      
-      // Inject Sanctified Status Marker if not present
-      if (!existingTraits.has('Sanctified Status')) {
-        finalAttributes.push({ trait_type: 'Sanctified Status', value: 'TRUE' });
-      }
+      dnaAttributes.forEach(attr => traitMap.set(attr.trait_type, attr.value));
+      traitMap.set('Sanctified Status', 'TRUE');
     }
+
+    const resolvedAttributes: Attribute[] = Array.from(traitMap, ([trait_type, value]) => ({ trait_type, value }));
 
     const responseMetadata: ERC721Metadata = {
       name: externalJsonPayload?.name || `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`,
       description: externalJsonPayload?.description || 'IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest',
       image: finalImage,
-      attributes: finalAttributes
+      attributes: resolvedAttributes
     };
 
     if (animationUrl) responseMetadata.animation_url = animationUrl;
@@ -323,17 +343,18 @@ app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<v
     res.status(200).json(responseMetadata);
   } catch (error: any) {
     console.error(`[EXECUTION ERROR] TokenID ${tokenId}:`, error.message || error);
-    res.status(200).json(FALLBACK_METADATA);
+    // เปลี่ยนสถานะเป็น 500 เพื่อป้องกัน Marketplace จดจำ Fallback เป็นข้อมูลถาวร
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.status(500).json({ error: 'TEMPORARY_NETWORK_FAILURE', message: 'RPC Failover Exhausted' });
   }
 });
 
-// Health Check Endpoint
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'HEALTHY', network: 'BASE MAINNET', target: CONTRACT_ADDRESS });
 });
 
-// Catch-All Handler
 app.use((_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.status(200).json(FALLBACK_METADATA);
 });
 
