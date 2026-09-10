@@ -1,216 +1,142 @@
+// ============================================================================
+// 🔥 WAR MACHINE MASTER ARCHITECTURE: DUAL-GATEWAY RACING & ANTI-LEAK
+// ============================================================================
 import express, { Request, Response, NextFunction } from 'express';
 import { Contract, JsonRpcProvider } from 'ethers';
 import cors from 'cors';
 import helmet from 'helmet';
 
-
-// ============================================================================
-// 🔱 การกำหนดค่าและค่าคงที่บนบล็อกเชน (CONFIGURATION & ON-CHAIN CONSTANTS)
-// ============================================================================
+// ⚙️ SYSTEM CONSTANTS
 const CONTRACT_ADDRESS = '0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2';
-const MASTER_IMAGE_FALLBACK = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
+const FALLBACK_IMAGE_URL = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
+const BASE_CHAIN_ID = 8453;
 
-const RPC_ENDPOINTS: string[] = [
+const RPC_ENDPOINTS = [
   'https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl',
   'https://mainnet.base.org',
   'https://base.llamarpc.com'
 ];
 
-const PROVIDERS: JsonRpcProvider[] = RPC_ENDPOINTS.map(
-  url => new JsonRpcProvider(url, 8453, { staticNetwork: true })
-);
-
-const CONTRACT_ABI: string[] = [
+const CONTRACT_ABI = [
   'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)'
 ];
 
-// ============================================================================
-// 🛡️ การระบุชนิดข้อมูลอย่างเข้มงวด (STRICT TYPE DEFINITIONS)
-// ============================================================================
-export interface Attribute {
-  trait_type: string;
-  value: string | boolean | number;
-}
-
-export interface OpenSeaMetadata {
-  name: string;
-  description: string;
-  image: string;
-  animation_url?: string;
-  external_url?: string;
-  attributes: Attribute[];
-}
-
-export interface NormalizedUri {
-  url: string;
-  txId: string | null;
-}
-
-export interface OnChainDeed {
-  owner: string;
-  active: boolean;
-  sanctified: boolean;
-  front: NormalizedUri;
-  back: NormalizedUri;
-  video: NormalizedUri;
-  dna: string;
-  hidden: NormalizedUri;
-}
-
-export interface StateUpdatePayload {
-  tokenId: string;
-  frontTxId?: string;
-  backTxId?: string;
-}
-
-// แคชดัชนีซิงค์สถานะในหน่วยความจำ (มอดูล 4)
-const DEED_STATE_INDEX = new Map<string, OnChainDeed>();
+const providerPool = RPC_ENDPOINTS.map(url => new JsonRpcProvider(url, BASE_CHAIN_ID, { staticNetwork: true }));
 
 // ============================================================================
-// ⚡ มอดูล 1: SOVEREIGN REBIRTH (RANK RESOLVER)
+// ⚙️ UTILITIES: TX_ID EXTRACTOR & NORMALIZER
 // ============================================================================
-function resolveRankTier(tokenId: bigint): string {
-  if (tokenId >= 1n && tokenId <= 3n) return 'PRIME';
-  if (tokenId >= 4n && tokenId <= 33n) return 'GOLDEN';
-  if (tokenId >= 34n && tokenId <= 100n) return 'SILVER CYPHER';
-  if (tokenId >= 101n && tokenId <= 250n) return 'THE RED MACHINE';
-  return 'IMMORTAL 333';
+function extractTxId(uri: string | null | undefined): string | null {
+  if (!uri) return null;
+  const t = uri.trim();
+  if (/^[a-zA-Z0-9_-]{43}$/.test(t)) return t;
+  if (t.includes('gateway.irys.xyz/')) return t.split('gateway.irys.xyz/')[1]?.split('?')[0] || null;
+  if (t.includes('arweave.net/')) return t.split('arweave.net/')[1]?.split('?')[0] || null;
+  if (t.startsWith('ar://')) return t.replace('ar://', '');
+  return null;
 }
 
-// ============================================================================
-// ⚡ มอดูล 2: SOVEREIGN NOVA (STRING PARSING ENGINE)
-// ============================================================================
-function parseRawUri(rawUri: string | null | undefined): NormalizedUri {
-  if (!rawUri) return { url: '', txId: null };
-  const trimmed = rawUri.trim();
-  if (!trimmed || trimmed.toUpperCase() === 'UNASSIGNED') return { url: '', txId: null };
-
-  let txId: string | null = null;
-  let url = trimmed;
-
-  if (trimmed.length >= 43 && !trimmed.includes('://') && !trimmed.includes('/')) {
-    txId = trimmed;
-    url = `https://gateway.irys.xyz/${trimmed}`;
-  } else if (trimmed.includes('gateway.irys.xyz/')) {
-    txId = trimmed.split('gateway.irys.xyz/')[1]?.split('?')[0] || null;
-  } else if (trimmed.includes('arweave.net/')) {
-    txId = trimmed.split('arweave.net/')[1]?.split('?')[0] || null;
-  } else if (trimmed.startsWith('ar://')) {
-    txId = trimmed.replace('ar://', '');
-    url = `https://arweave.net/${txId}`;
-  } else if (trimmed.startsWith('ipfs://')) {
-    url = `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
-  }
-
-  return { url, txId };
+function normalizeUri(uri: string | null | undefined): string {
+  if (!uri) return '';
+  const txId = extractTxId(uri);
+  if (txId) return `https://gateway.irys.xyz/${txId}`; // Default display URL
+  const trimmed = uri.trim();
+  if (trimmed.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
+  return trimmed;
 }
 
-/**
- * แยกแยะข้อความ DNA ดิบจาก Smart Contract ให้เป็นโครงสร้าง Attributes สำหรับ Marketplace
- * ตัวอย่างข้อมูลขาเข้า: "SOVEREIGN NOVA : STRINGS MEMORY DNA : IDENTITY DNA : SAKSIT | PIXEL ANCHOR : X : 1014 , Y : 1754 | CHRONO-MAP : SANCTIFIED AT 12S FR 1-5"
- */
-export function parseSovereignNovaDna(rawDna: string | null | undefined): Attribute[] {
-  if (!rawDna || typeof rawDna !== 'string') return [];
+function parseDnaAttributes(dnaStr: string): { trait_type: string; value: string }[] {
+  const attributes: { trait_type: string; value: string }[] = [];
+  if (!dnaStr) return attributes;
+
+  const cleanDna = dnaStr.replace(/SOVEREIGN NOVA\s*:\s*STRINGS MEMORY DNA\s*:\s*/i, '');
+  const segments = cleanDna.split('|');
   
-  // ลบ Prefix หัวเรื่องออกโดยอัตโนมัติ
-  const cleanString = rawDna
-    .replace(/^SOVEREIGN\s+NOVA\s*:\s*/i, '')
-    .replace(/^STRINGS\s+MEMORY\s+DNA\s*:\s*/i, '')
-    .trim();
-
-  if (!cleanString || cleanString.toUpperCase() === 'UNASSIGNED') return [];
-
-  const attributes: Attribute[] = [];
-  const segments = cleanString.split('|');
-
   for (const segment of segments) {
     const trimmed = segment.trim();
     if (!trimmed) continue;
-
+    
     const colonIndex = trimmed.indexOf(':');
-    if (colonIndex === -1) continue;
-
-    const key = trimmed.substring(0, colonIndex).trim();
-    let value = trimmed.substring(colonIndex + 1).trim();
-
-    if (!key) continue;
-
-    // ปรับรูปแบบ Spatial Anchor ให้เป็นมาตรฐาน: "X : 1014 , Y : 1754" -> "X: 1014, Y: 1754"
-    if (key === 'PIXEL ANCHOR') {
-      value = value.replace(/\s*:\s*/g, ': ').replace(/\s*,\s*/g, ', ');
+    if (colonIndex !== -1) {
+      const rawKey = trimmed.substring(0, colonIndex).trim();
+      const rawValue = trimmed.substring(colonIndex + 1).trim();
+      attributes.push({ trait_type: rawKey, value: rawValue });
+    } else {
+      attributes.push({ trait_type: 'Data Record', value: trimmed });
     }
-
-    attributes.push({
-      trait_type: key,
-      value: value
-    });
   }
-
   return attributes;
 }
 
 // ============================================================================
-// 🛡️ เอนจิน GATEWAY RACE
+// 🚀 DUAL-GATEWAY RACING ENGINE (IRYS VS ARWEAVE)
 // ============================================================================
-async function raceGateways(txId: string | null, fallbackUrl: string): Promise<{ url: string; contentType: string }> {
-  const targetTx = txId || fallbackUrl;
-  if (!targetTx) return { url: '', contentType: 'unknown' };
-
-  const irysUrl = targetTx.startsWith('http') ? targetTx : `https://gateway.irys.xyz/${targetTx}`;
-  const arweaveUrl = targetTx.startsWith('http') ? targetTx : `https://arweave.net/${targetTx}`;
-
+async function fetchJsonWithRace(uri: string) {
+  if (!uri) return null;
+  const txId = extractTxId(uri);
+  
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3500);
+  // 🚨 ตัดจบที่ 2.0 วินาที ป้องกัน Time-out จาก OpenSea
+  const timeoutId = setTimeout(() => controller.abort(), 2000); 
 
   try {
-    const winner = await Promise.any([
-      fetch(irysUrl, { method: 'HEAD', signal: controller.signal }).then(r => r.ok ? { res: r, url: irysUrl } : Promise.reject()),
-      fetch(arweaveUrl, { method: 'HEAD', signal: controller.signal }).then(r => r.ok ? { res: r, url: arweaveUrl } : Promise.reject())
-    ]);
-
-    const contentType = (winner.res.headers.get('content-type') || '').toLowerCase();
-    return { url: winner.url, contentType };
-  } catch {
-    return { url: irysUrl, contentType: 'unknown' };
+    if (txId) {
+      const urls = [`https://gateway.irys.xyz/${txId}`, `https://arweave.net/${txId}`];
+      
+      // Promise.any: ใครตอบกลับก่อน เอาข้อมูลนั้นทันที
+      return await Promise.any(urls.map(async (url) => {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) throw new Error(`Gateway Error: ${url}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('json') && !contentType.includes('text/plain')) {
+            throw new Error('Not JSON');
+        }
+        return await res.json();
+      }));
+    } else {
+      // กรณีเป็น URL ปกติ
+      const res = await fetch(uri, { signal: controller.signal });
+      if (!res.ok) throw new Error('HTTP Error');
+      return await res.json();
+    }
+  } catch (error) {
+    return null; // เงียบไว้ ไม่ให้กระทบระบบหลัก
   } finally {
-    clearTimeout(timeoutId);
+    // 🚨 ทำลายขยะในหน่วยความจำ ป้องกัน Memory Leak 100%
+    clearTimeout(timeoutId); 
   }
 }
 
 // ============================================================================
-// 🛡️ การอ่านข้อมูลสัญญาพร้อมระบบ FAILOVER
+// 🛡️ SMART CONTRACT INTERROGATOR
 // ============================================================================
-async function executeContractReadWithRetry(tokenId: bigint): Promise<OnChainDeed> {
+async function executeContractRead(tokenId: bigint) {
   let lastError: Error | null = null;
-
-  for (const provider of PROVIDERS) {
+  for (const provider of providerPool) {
     try {
       const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
-      const rawData: any = await Promise.race([
-        contract.getDeedData(tokenId),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('RPC_TIMEOUT')), 2500))
-      ]);
-
+      const timeoutPromise = new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC Timeout')), 2000));
+      const rawData: any = await Promise.race([contract.getDeedData(tokenId), timeoutPromise]);
+      
       return {
-        owner: String(rawData[0] ?? ''),
-        active: Boolean(rawData[1]),
+        owner: String(rawData[0]),
+        active: Boolean(rawData[1]), 
         sanctified: Boolean(rawData[2]),
-        front: parseRawUri(rawData[3]),
-        back: parseRawUri(rawData[4]),
-        video: parseRawUri(rawData[5]),
-        dna: String(rawData[6] || ''),
-        hidden: parseRawUri(rawData[7])
+        front: String(rawData[3] || ''), 
+        back: String(rawData[4] || ''),
+        video: String(rawData[5] || ''), 
+        dna: String(rawData[6] || ''), 
+        hidden: String(rawData[7] || '')
       };
     } catch (err: any) {
       lastError = err;
     }
   }
-
-  throw lastError || new Error('ALL_RPC_ENDPOINTS_FAILED');
+  throw lastError || new Error('All RPC endpoints failed.');
 }
 
 // ============================================================================
-// 🔱 ตัวจัดการเส้นทางเซิร์ฟเวอร์ (SERVER ROUTER)
+// 🔱 MASTER EXPRESS ENDPOINT
 // ============================================================================
 const app = express();
 app.use(helmet());
@@ -222,189 +148,91 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// ----------------------------------------------------------------------------
-// เส้นทาง METADATA (มอดูล 1 และ มอดูล 2)
-// ----------------------------------------------------------------------------
 app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<void> => {
+  const { tokenId } = req.params;
+
   try {
-    const rawTokenParam = (req.params.tokenId || '').replace(/\.json$/, '');
-
-    if (!/^\d+$/.test(rawTokenParam)) {
-      res.status(400).json({ error: 'INVALID_TOKEN_ID', message: 'Token ID must be a non-negative integer.' });
-      return;
-    }
-
-    const numericId = BigInt(rawTokenParam);
-    const deedData = await executeContractReadWithRetry(numericId);
-
-    // มอดูล 4: อัปเดตแคชในหน่วยความจำ
-    DEED_STATE_INDEX.set(rawTokenParam, deedData);
-
-    // ตรวจสอบสถานะการเผา (Burn) / ไม่ใช้งาน (Inactive)
-    if (!deedData.active) {
-      const inactiveMetadata: OpenSeaMetadata = {
-        name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${rawTokenParam}`,
+    const parsedTokenId = BigInt(tokenId);
+    const deedData = await executeContractRead(parsedTokenId);
+    
+    if (!deedData.active) { 
+      res.status(200).json({
+        name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`,
         description: 'UNCOMPROMISED INTEGRITY PROTOCOL',
-        image: MASTER_IMAGE_FALLBACK,
-        attributes: []
-      };
-      res.status(200).json(inactiveMetadata);
-      return;
+        image: FALLBACK_IMAGE_URL,
+        attributes: [{ trait_type: 'Status', value: 'Burned / Inactive' }]
+      }); 
+      return; 
     }
 
-    const [frontRace, backRace] = await Promise.all([
-      deedData.front.url ? raceGateways(deedData.front.txId, deedData.front.url) : Promise.resolve(null),
-      deedData.back.url ? raceGateways(deedData.back.txId, deedData.back.url) : Promise.resolve(null)
-    ]);
+    let finalMetadata: any = {
+      name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`,
+      description: 'IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest',
+      image: FALLBACK_IMAGE_URL,
+      attributes: []
+    };
 
-    let externalJsonPayload: any = null;
-
-    if (frontRace?.contentType.includes('application/json') && frontRace.url) {
-      const c = new AbortController();
-      const timeoutId = setTimeout(() => c.abort(), 2000);
-      try {
-        const jsonRes = await fetch(frontRace.url, { signal: c.signal });
-        if (jsonRes.ok) externalJsonPayload = await jsonRes.json();
-      } catch {
-        // สำรองใช้สถานะบนเชน
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    }
-
-    // รวบรวม Attributes
-    const attributes: Attribute[] = Array.isArray(externalJsonPayload?.attributes) ? externalJsonPayload.attributes : [];
-
-    // มอดูล 1: เพิ่ม Attribute สำหรับ Rank
-    const rankTier = resolveRankTier(numericId);
-    if (!attributes.some(a => a.trait_type === 'Rank')) {
-      attributes.unshift({ trait_type: 'Rank', value: rankTier });
-    }
-
-    // มอดูล 2: วิเคราะห์ข้อความ DNA บนเชน
-    if (deedData.sanctified && deedData.dna) {
-      const parsedDnaAttrs = parseSovereignNovaDna(deedData.dna);
-      const existingTraits = new Set(attributes.map(a => a.trait_type));
-      for (const dnaAttr of parsedDnaAttrs) {
-        if (!existingTraits.has(dnaAttr.trait_type)) {
-          attributes.push(dnaAttr);
+    // 🚨 ดึงข้อมูลด้วย Dual-Gateway Racing
+    if (deedData.front) {
+      const fetchedJson = await fetchJsonWithRace(deedData.front);
+      if (fetchedJson) {
+        finalMetadata = { ...finalMetadata, ...fetchedJson };
+        if (!Array.isArray(finalMetadata.attributes)) finalMetadata.attributes = [];
+        if (finalMetadata.image) finalMetadata.image = normalizeUri(finalMetadata.image);
+      } else {
+        // หาก Front ไม่ใช่ JSON หรือดึงไม่สำเร็จ ให้ลองใช้เป็น Image URL โดยตรง
+        const frontUrl = normalizeUri(deedData.front);
+        if (frontUrl && finalMetadata.image === FALLBACK_IMAGE_URL) {
+          finalMetadata.image = frontUrl;
         }
       }
     }
 
-    // รวบรวม Metadata ขั้นสุดท้าย
-    const metadata: OpenSeaMetadata = {
-      name: externalJsonPayload?.name || `THE IMPERIAL SOVEREIGN DEED ♠️ #${rawTokenParam}`,
-      description: externalJsonPayload?.description || 'UNCOMPROMISED INTEGRITY PROTOCOL',
-      image: externalJsonPayload?.image
-        ? parseRawUri(externalJsonPayload.image).url
-        : (frontRace?.url || deedData.front.url || MASTER_IMAGE_FALLBACK),
-      attributes
-    };
-
-    // แนบ Video / Media
-    if (deedData.video.url) {
-      metadata.animation_url = deedData.video.url;
-    } else if (externalJsonPayload?.animation_url) {
-      metadata.animation_url = parseRawUri(externalJsonPayload.animation_url).url;
+    // 🚨 ประกอบร่างข้อมูลที่เหลือจาก Smart Contract
+    const dnaAttributes = parseDnaAttributes(deedData.dna);
+    if (dnaAttributes.length > 0) {
+      finalMetadata.attributes = [...finalMetadata.attributes, ...dnaAttributes];
     }
 
-    // แนบ URL ที่ซ่อนอยู่ (Hidden URL)
-    if (deedData.hidden.url) {
-      metadata.external_url = deedData.hidden.url;
-    } else if (backRace?.url) {
-      metadata.external_url = backRace.url;
-    } else if (deedData.back.url) {
-      metadata.external_url = deedData.back.url;
+    const backUrl = normalizeUri(deedData.back);
+    if (backUrl) {
+        if (finalMetadata.image === FALLBACK_IMAGE_URL) finalMetadata.image = backUrl;
+        finalMetadata.attributes.push({ trait_type: 'BACK URI', value: backUrl });
     }
 
-    res.status(200).json(metadata);
+    const videoUrl = normalizeUri(deedData.video);
+    if (videoUrl) finalMetadata.animation_url = videoUrl;
+
+    const hiddenUrl = normalizeUri(deedData.hidden);
+    if (hiddenUrl) finalMetadata.external_url = hiddenUrl;
+
+    finalMetadata.attributes.push({ 
+      trait_type: 'Sanctified', 
+      value: deedData.sanctified ? 'TRUE' : 'FALSE' 
+    });
+
+    res.status(200).json(finalMetadata);
 
   } catch (error: any) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.status(502).json({
-      error: 'ON_CHAIN_READ_FAILED',
-      message: error?.message || 'Failed to read transaction state from Base RPC endpoints.'
-    });
-  }
-});
-
-// ----------------------------------------------------------------------------
-// มอดูล 3: UPDATE IDENTITY (ตัวจัดการการเปลี่ยนแปลงสถานะ)
-// ----------------------------------------------------------------------------
-app.post('/api/sync/update', (req: Request, res: Response): void => {
-  const body: StateUpdatePayload = req.body;
-
-  if (!body || !body.tokenId || !/^\d+$/.test(body.tokenId)) {
-    res.status(400).json({ error: 'INVALID_PAYLOAD', message: 'Valid tokenId is required.' });
-    return;
-  }
-
-  const existingState = DEED_STATE_INDEX.get(body.tokenId);
-  if (!existingState) {
-    res.status(444).json({ error: 'CACHE_MISS', message: 'Token must be indexed via GET /api/metadata first.' });
-    return;
-  }
-
-  if (body.frontTxId) {
-    existingState.front = parseRawUri(body.frontTxId);
-  }
-  if (body.backTxId) {
-    existingState.back = parseRawUri(body.backTxId);
-  }
-
-  DEED_STATE_INDEX.set(body.tokenId, existingState);
-
-  res.status(200).json({
-    status: 'MUTATED',
-    tokenId: body.tokenId,
-    updatedFront: existingState.front.url,
-    updatedBack: existingState.back.url
-  });
-});
-
-// ----------------------------------------------------------------------------
-// มอดูล 4: SOVEREIGN REMINT (ตัวทำดัชนีซิงค์ข้อมูล)
-// ----------------------------------------------------------------------------
-app.get('/api/deeds/:tokenId/sync', async (req: Request, res: Response): Promise<void> => {
-  const rawTokenParam = req.params.tokenId;
-
-  if (!/^\d+$/.test(rawTokenParam)) {
-    res.status(400).json({ error: 'INVALID_TOKEN_ID', message: 'Token ID must be a non-negative integer.' });
-    return;
-  }
-
-  try {
-    const numericId = BigInt(rawTokenParam);
-    const deedData = await executeContractReadWithRetry(numericId);
-
-    DEED_STATE_INDEX.set(rawTokenParam, deedData);
-
     res.status(200).json({
-      tokenId: rawTokenParam,
-      owner: deedData.owner,
-      active: deedData.active,
-      sanctified: deedData.sanctified,
-      frontUri: deedData.front.url,
-      backUri: deedData.back.url,
-      videoUrl: deedData.video.url,
-      hiddenUrl: deedData.hidden.url,
-      dna: deedData.dna
+        name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${tokenId}`,
+        description: 'UNCOMPROMISED INTEGRITY PROTOCOL',
+        image: FALLBACK_IMAGE_URL,
+        attributes: [{ trait_type: 'Status', value: 'Pending Data / Error' }]
     });
-  } catch (error: any) {
-    res.status(502).json({ error: 'SYNC_FAILED', message: error?.message || 'RPC synchronization error.' });
   }
 });
 
-// ตรวจสอบการทำงานของระบบ (Health Check)
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'HEALTHY', network: 'BASE MAINNET', target: CONTRACT_ADDRESS });
 });
 
-// จัดการกรณีไม่พบเส้นทาง (404 Route handling)
-app.use((_req: Request, res: Response) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.status(404).json({ error: 'ENDPOINT_NOT_FOUND' });
+app.use((_req: Request, res: Response) => { 
+  res.status(200).json({
+    name: 'THE IMPERIAL SOVEREIGN DEED ♠️',
+    description: 'UNCOMPROMISED INTEGRITY PROTOCOL',
+    image: FALLBACK_IMAGE_URL
+  }); 
 });
 
 export default app;
