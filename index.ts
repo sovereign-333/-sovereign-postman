@@ -2,146 +2,147 @@ import express, { Request, Response, NextFunction } from 'express';
 import { Contract, JsonRpcProvider } from 'ethers';
 import cors from 'cors';
 import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { LRUCache } from 'lru-cache';
 
+// ============================================================================
+// 🔱 1. ON-CHAIN CONFIGURATION & GLOBAL INSTANCES
+// ============================================================================
 const CONTRACT_ADDRESS = '0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2';
-const FALLBACK_IMAGE_URL = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
+const FALLBACK_IMAGE = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
 
-// Hard Code Alchemy ตามสั่ง ไม่ใช้ ENV
-const RPC_ENDPOINTS: string[] = [
+const RPC_ENDPOINTS = [
   'https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl',
   'https://mainnet.base.org',
   'https://base.llamarpc.com'
 ];
 
-const PROVIDERS: JsonRpcProvider[] = RPC_ENDPOINTS.map(
-  url => new JsonRpcProvider(url, 8453, { staticNetwork: true })
-);
-
 const CONTRACT_ABI = [
-  'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)'
+  'function getDeedData(uint256 t) external view returns (address owner, bool active, bool sanctified, string memory front, string memory back, string memory video, string memory dna, string memory hidden)',
+  'function getTBA(uint256 t) public view returns (address)'
 ];
 
-const FALLBACK_METADATA = {
-  name: 'THE IMPERIAL SOVEREIGN DEED ♠️',
-  description: 'UNCOMPROMISED INTEGRITY PROTOCOL',
-  image: FALLBACK_IMAGE_URL,
-  attributes: [{ trait_type: 'Status', value: 'Burned / Inactive / Pending' }]
+const PROVIDERS = RPC_ENDPOINTS.map(url => new JsonRpcProvider(url, 8453, { staticNetwork: true }));
+const CONTRACTS = PROVIDERS.map(provider => new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider));
+
+// ============================================================================
+// 🛡️ 2. SECURITY & CACHING
+// ============================================================================
+const metadataCache = new LRUCache<string, any>({
+  max: 2000,
+  ttl: 1000 * 60 * 3, 
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, 
+  max: 200, 
+  message: { error: 'TOO_MANY_REQUESTS', message: 'Rate limit exceeded. Try again in a minute.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json, image/*, video/*, */*'
 };
 
-function parseDnaAttributes(dnaStr: string | null | undefined): any[] {
-  const attributes: any[] = [];
-  if (!dnaStr || typeof dnaStr !== 'string' || dnaStr.toUpperCase() === 'UNASSIGNED') return attributes;
-
-  const cleanDna = dnaStr.replace(/^.*?STRINGS\s+MEMORY\s+DNA\s*:\s*/i, '').trim();
-  const segments = cleanDna.split('|');
+// ============================================================================
+// ⚙️ 3. URL UNPACKER & DYNAMIC BASKET RESOLUTION (การแกะ URL)
+// ============================================================================
+function parseRawUri(rawUri: string | null): string {
+  if (!rawUri || rawUri.toUpperCase() === 'UNASSIGNED') return '';
+  let trimmed = rawUri.trim();
   
-  for (const segment of segments) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-    const colonIdx = trimmed.indexOf(':');
-    if (colonIdx !== -1) {
-      let key = trimmed.substring(0, colonIdx).trim();
-      let val = trimmed.substring(colonIdx + 1).trim();
-      
-      if (key.toUpperCase() === 'PIXEL ANCHOR') {
-        val = val.replace(/\s*:\s*/g, ': ').replace(/\s*,\s*/g, ', ');
-      }
-      attributes.push({ trait_type: key, value: val });
-    }
-  }
-  return attributes;
+  // แปลง Protocol พื้นฐานให้ทะลุ Gateway
+  if (/^[a-zA-Z0-9_-]{43}$/.test(trimmed)) return `https://gateway.irys.xyz/${trimmed}`; 
+  if (trimmed.startsWith('ar://')) return `https://gateway.irys.xyz/${trimmed.replace('ar://', '')}`;
+  if (trimmed.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
+  return trimmed;
 }
 
-// ยิง Fetch ตรงๆ ด้วย URL ที่ได้มาจาก Smart Contract
-async function fetchJsonPayload(url: string): Promise<any> {
-  if (!url || url.trim() === '' || url.toUpperCase() === 'UNASSIGNED') return null;
+// 🔥 [UPGRADE: MASTER OVERRIDE] ฟังก์ชันประกอบร่าง URL จาก "ไม้ตะกร้า"
+function resolveBasketUrl(uri: string, tokenId: string): string {
+  if (!uri) return '';
   
-  // จัดการเผื่อกรณีใส่ลิงก์มาไม่ครบ แต่เน้นใช้ URL เดิมเป็นหลัก
-  const fetchUrl = url.startsWith('http') ? url : `https://${url.replace(/^ar:\/\//, 'gateway.irys.xyz/')}`;
+  // หาก URL จบด้วยนามสกุลไฟล์อยู่แล้ว (.png, .json, .mp4, ฯลฯ) ถือว่าเป็นไฟล์เดี่ยว ปล่อยผ่าน
+  if (uri.match(/\.[a-zA-Z0-9]{2,5}$/)) return uri;
+
+  // หาก URL ไม่มีนามสกุลไฟล์ ระบบจะตีความว่าเป็น "Directory/ไม้ตะกร้า" 
+  // และทำการประกอบร่าง /tokenId.png เข้าไปโดยอัตโนมัติ
+  const cleanUri = uri.replace(/\/$/, ''); // ตัด slash ตัวท้ายออก (ถ้ามี) ป้องกัน slash ซ้อนกัน
+  return `${cleanUri}/${tokenId}.png`;
+}
+
+// ============================================================================
+// ⚡ 4. GATEWAY RACER & CONTENT INSPECTOR 
+// ============================================================================
+async function inspectAndRaceGateways(txId: string): Promise<{ url: string; contentType: string; jsonData?: any }> {
+  if (!txId) return { url: '', contentType: 'unknown' };
+
+  const baseTx = txId.replace('ar://', '').replace('https://gateway.irys.xyz/', '').replace('https://arweave.net/', '');
+  const isDirectHttp = txId.startsWith('http') && !txId.includes('irys.xyz') && !txId.includes('arweave.net');
   
+  const irysUrl = isDirectHttp ? txId : `https://gateway.irys.xyz/${baseTx}`;
+  const arUrl = isDirectHttp ? txId : `https://arweave.net/${baseTx}`;
+
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3000);
+  const timeoutId = setTimeout(() => controller.abort(), 3000); 
+
   try {
-    const res = await fetch(fetchUrl, { signal: controller.signal });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+    const winnerRes = await Promise.any([
+      fetch(irysUrl, { signal: controller.signal, headers: FETCH_HEADERS }).then(r => r.ok ? r : Promise.reject()),
+      fetch(arUrl, { signal: controller.signal, headers: FETCH_HEADERS }).then(r => r.ok ? r : Promise.reject())
+    ]);
+
+    const contentType = (winnerRes.headers.get('content-type') || '').toLowerCase();
+    const winnerUrl = winnerRes.url;
+
+    if (contentType.includes('application/json') || winnerUrl.endsWith('.json')) {
+      const jsonData = await winnerRes.json();
+      return { url: winnerUrl, contentType, jsonData };
+    }
+
+    return { url: winnerUrl, contentType };
+  } catch (err) {
+    return { url: irysUrl, contentType: 'unknown' }; // Fallback
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-async function fetchMetadataOrAsset(url: string): Promise<{ type: 'json' | 'media' | 'unknown'; data: any }> {
-  if (!url || url.trim() === '' || url.toUpperCase() === 'UNASSIGNED') return { type: 'unknown', data: null };
+// ============================================================================
+// ⚖️ 5. ON-CHAIN TRUTH EXTRACTOR 
+// ============================================================================
+async function getSovereignTruth(tokenId: bigint): Promise<any> {
+  let lastError = null;
 
-  const targetUrl = url.startsWith('http') ? url : `https://${url.replace(/^ar:\/\//, 'gateway.irys.xyz/')}`;
-  const backupUrl = targetUrl.replace('gateway.irys.xyz', 'arweave.net'); // หรือ Gateway สำรอง
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3000);
-
-  try {
-    // ยิง 2 Gateway พร้อมกัน ใครมาก่อนเอาตัวนั้น (Race)
-    const fetchWithTimeout = async (endpoint: string) => {
-      const res = await fetch(endpoint, { method: 'HEAD', signal: controller.signal });
-      if (!res.ok) throw new Error('Not OK');
-      return {
-        contentType: res.headers.get('content-type') || '',
-        url: endpoint.replace('/HEAD', '') // ถ้าใช้ HEAD บางเกตเวย์ไม่รองรับ ให้สลับมาใช้ GET แบบ Range หรือระมัดระวังเรื่อง Method
-      };
-    };
-
-    // ใช้ GET แบบขอแค่ Header หรือเช็กนามสกุล/Content-Type เบื้องต้น
-    const raceResult: any = await Promise.race([
-      fetch(targetUrl, { method: 'GET', headers: { Range: 'bytes=0-512' }, signal: controller.signal }),
-      fetch(backupUrl, { method: 'GET', headers: { Range: 'bytes=0-512' }, signal: controller.signal })
-    ]);
-
-    clearTimeout(timeoutId);
-    
-    const contentType = raceResult.headers.get('content-type') || '';
-    const finalUrl = raceResult.url || targetUrl;
-
-    if (contentType.includes('application/json')) {
-      const fullRes = await fetch(finalUrl);
-      const json = await fullRes.json();
-      return { type: 'json', data: json };
-    } else {
-      // ถ้าเป็น Video หรือ Image ส่ง URL ตรงไปเลย ไม่ต้องโหลดก้อนข้อมูล
-      return { type: 'media', data: finalUrl };
-    }
-
-  } catch {
-    clearTimeout(timeoutId);
-    return { type: 'unknown', data: targetUrl }; // Fallback ส่ง URL ดิบไปตามทรง
-  }
-}
-
-
-async function executeContractReadWithRetry(tokenId: bigint): Promise<any> {
-  let lastError: Error | null = null;
-  for (const provider of PROVIDERS) {
-    let timeoutId: NodeJS.Timeout | undefined;
+  for (const contract of CONTRACTS) {
+    let timeoutId;
     try {
-      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
-      const rawData: any = await Promise.race([
+      const fetchPromise = Promise.all([
         contract.getDeedData(tokenId),
-        new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error('RPC_TIMEOUT')), 2500); })
+        contract.getTBA(tokenId).catch(() => '0x0000000000000000000000000000000000000000') 
       ]);
+
+      const [deed, tbaAddress] = await Promise.race([
+        fetchPromise,
+        new Promise<any>((_, rej) => { timeoutId = setTimeout(() => rej(new Error('RPC_TIMEOUT')), 2500); })
+      ]);
+
       return {
-        owner: String(rawData[0] ?? ''), 
-        active: Boolean(rawData[1]), 
-        sanctified: Boolean(rawData[2]),
-        front: String(rawData[3] || '').trim(), 
-        back: String(rawData[4] || '').trim(), 
-        video: String(rawData[5] || '').trim(),
-        dna: String(rawData[6] || '').trim(), 
-        hidden: String(rawData[7] || '').trim()
+        owner: String(deed[0] ?? ''),
+        active: Boolean(deed[1]),
+        sanctified: Boolean(deed[2]),
+        front: parseRawUri(deed[3]),
+        back: parseRawUri(deed[4]),
+        video: parseRawUri(deed[5]),
+        dna: String(deed[6] || '').trim(),
+        hidden: parseRawUri(deed[7]),
+        tba: tbaAddress
       };
     } catch (err: any) {
       lastError = err;
-      if (err?.message?.includes('revert') || err?.message?.includes('NonexistentToken')) {
+      if (err.message.includes('revert') || err.message.includes('NonexistentToken')) {
         throw new Error('TOKEN_NOT_FOUND');
       }
     } finally {
@@ -151,97 +152,110 @@ async function executeContractReadWithRetry(tokenId: bigint): Promise<any> {
   throw lastError || new Error('ALL_RPC_FAILED');
 }
 
+// ============================================================================
+// 🚀 6. API SERVER (DELIVERY PROTOCOL)
+// ============================================================================
 const app = express();
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use('/api/', apiLimiter);
 
-app.use((_req: Request, res: Response, next: NextFunction) => {
+app.use((_req, res, next) => {
   res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
   next();
 });
 
 app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<void> => {
   const cleanTokenIdStr = (req.params.tokenId || '').replace(/\.json$/, '');
-  
-  if (!/^\d+$/.test(cleanTokenIdStr)) { res.status(200).json(FALLBACK_METADATA); return; }
+  if (!/^\d+$/.test(cleanTokenIdStr)) { res.status(400).json({ error: 'INVALID_TOKEN_FORMAT' }); return; }
   const numericId = BigInt(cleanTokenIdStr);
-  if (numericId < 1n || numericId > 333n) { res.status(200).json(FALLBACK_METADATA); return; }
+
+  const cacheKey = `metadata_${cleanTokenIdStr}`;
+  if (metadataCache.has(cacheKey)) {
+    res.status(200).json(metadataCache.get(cacheKey));
+    return;
+  }
 
   try {
-    const deedData = await executeContractReadWithRetry(numericId);
+    const truth = await getSovereignTruth(numericId);
 
-    if (!deedData.active || deedData.owner === '0x0000000000000000000000000000000000000000') {
-      res.status(200).json({
-        name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${cleanTokenIdStr} (Burned)`,
-        description: 'This deed has been returned to the reserve.',
-        image: FALLBACK_IMAGE_URL,
-        attributes: [{ trait_type: 'Status', value: 'Burned / Inactive / Pending' }]
-      });
-      return;
+    if (!truth.active || truth.owner === '0x0000000000000000000000000000000000000000') {
+      res.status(404).json({ error: 'TOKEN_BURNED_OR_INACTIVE' }); return;
     }
 
-    let finalMetadata: any = {};
+    // 💥 เรียกใช้งานฟังก์ชัน "แกะ URL ไม้ตะกร้า" ก่อนนำไปยิง Gateway
+    const resolvedFront = resolveBasketUrl(truth.front, cleanTokenIdStr);
+    const inspection = await inspectAndRaceGateways(resolvedFront);
 
-    // 1. Pass-Through: โยน URL หน้าดื้อๆ เข้าไป Fetch เลย
-    if (deedData.front && deedData.front.toUpperCase() !== 'UNASSIGNED') {
-      const jsonPayload = await fetchJsonPayload(deedData.front);
-      if (jsonPayload) {
-        finalMetadata = { ...jsonPayload };
-      }
-    }
+    let finalResponseData: any;
 
-    // 2. Fallback กันพัง
-    if (!finalMetadata.name) finalMetadata.name = `THE IMPERIAL SOVEREIGN DEED ♠️ #${cleanTokenIdStr}`;
-    if (!finalMetadata.description) finalMetadata.description = 'UNCOMPROMISED INTEGRITY PROTOCOL';
-    if (!finalMetadata.attributes) finalMetadata.attributes = [];
+    if (inspection.contentType.includes('application/json') || inspection.jsonData) {
+      finalResponseData = inspection.jsonData;
+    } else {
+      // โครงสร้างมาตรฐานตามภาพอ้างอิงของคุณ
+      finalResponseData = {
+        name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${cleanTokenIdStr}`,
+        description: 'IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest',
+        attributes: [
+          { trait_type: 'RANK', value: 'THE COUNCIL PRIME' },
+          { trait_type: 'IDENTITY STATUS', value: 'UNCOMPROMISED INTEGRITY PROTOCOL' }
+        ]
+      };
 
-    // เปลี่ยนรูป (back)
-    if (!finalMetadata.image) {
-      if (deedData.back && deedData.back.toUpperCase() !== 'UNASSIGNED') {
-        finalMetadata.image = deedData.back;
+      // ควบคุมการแสดงผล Image / Animation URL
+      if (inspection.contentType.includes('video') || inspection.url.endsWith('.mp4')) {
+        finalResponseData.animation_url = inspection.url;
+        finalResponseData.image = FALLBACK_IMAGE;
       } else {
-        finalMetadata.image = FALLBACK_IMAGE_URL;
+        // นำ URL ที่ถูกแกะและประกอบร่างสมบูรณ์ (เช่น .../333.png) มาแสดงผล
+        finalResponseData.image = inspection.url || FALLBACK_IMAGE;
       }
-    }
 
-    // เปลี่ยนวิดีโอ (video)
-    if (!finalMetadata.animation_url && deedData.video && deedData.video.toUpperCase() !== 'UNASSIGNED') {
-      finalMetadata.animation_url = deedData.video;
-    }
+      // จัดการส่วน Back / Video (รองรับระบบไม้ตะกร้าเช่นกัน)
+      if (truth.video || truth.back) {
+        const targetSecondary = truth.video ? truth.video : truth.back;
+        const resolvedSecondary = resolveBasketUrl(targetSecondary, cleanTokenIdStr);
+        const secInspection = await inspectAndRaceGateways(resolvedSecondary);
+        finalResponseData.animation_url = secInspection.url;
+      }
 
-    // 3. ผสม DNA
-    if (deedData.sanctified && deedData.dna) {
-      const dnaAttributes = parseDnaAttributes(deedData.dna);
-      const existingTraits = new Set(finalMetadata.attributes.map((a: any) => a.trait_type));
+      if (truth.hidden) finalResponseData.external_url = truth.hidden;
       
-      for (const dnaAttr of dnaAttributes) {
-        if (!existingTraits.has(dnaAttr.trait_type)) {
-          finalMetadata.attributes.push(dnaAttr);
-        }
+      // Inject TBA Address (ถ้ามี)
+      if (truth.tba && truth.tba !== '0x0000000000000000000000000000000000000000') {
+        finalResponseData.attributes.push({ trait_type: 'Token Bound Account', value: truth.tba });
+      }
+
+      // Inject DNA Traits (ถ้ามี)
+      if (truth.sanctified && truth.dna && truth.dna.toUpperCase() !== 'UNASSIGNED') {
+        const cleanDna = truth.dna.replace(/^.*?STRINGS\s+MEMORY\s+DNA\s*:\s*/i, '').trim();
+        cleanDna.split('|').forEach(segment => {
+          const [key, ...valParts] = segment.split(':');
+          if (key && valParts.length) {
+            finalResponseData.attributes.push({ trait_type: key.trim(), value: valParts.join(':').trim() });
+          }
+        });
       }
     }
 
-    // ซ่อนข้อมูล (hidden)
-    if (!finalMetadata.external_url && deedData.hidden && deedData.hidden.toUpperCase() !== 'UNASSIGNED') {
-      finalMetadata.external_url = deedData.hidden;
-    }
-
-    res.status(200).json(finalMetadata);
+    metadataCache.set(cacheKey, finalResponseData);
+    res.status(200).json(finalResponseData);
 
   } catch (error: any) {
     if (error.message === 'TOKEN_NOT_FOUND') {
-      res.status(200).json(FALLBACK_METADATA);
+      res.status(404).json({ error: 'TOKEN_NOT_FOUND' });
     } else {
-      res.status(500).json({ error: "INTERNAL_SERVER_ERROR_OR_RPC_TIMEOUT" });
+      res.status(200).json({
+        name: `Sovereign Deed #${cleanTokenIdStr}`,
+        description: 'Syncing to blockchain...',
+        image: FALLBACK_IMAGE
+      });
     }
   }
 });
 
-app.get('/health', (_req: Request, res: Response) => {
-  res.status(200).json({ status: 'HEALTHY', network: 'BASE MAINNET', target: CONTRACT_ADDRESS });
-});
-
-app.use((_req: Request, res: Response) => { res.status(200).json(FALLBACK_METADATA); });
+app.get('/health', (_req, res) => res.status(200).json({ status: 'HEALTHY', cache_size: metadataCache.size }));
+app.use((_req, res) => { res.status(404).json({ error: 'NOT_FOUND' }); });
 
 export default app;
