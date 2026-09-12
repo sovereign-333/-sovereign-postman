@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { Request, Response } from 'express';
 import { Contract, JsonRpcProvider } from 'ethers';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -9,7 +9,7 @@ import { LRUCache } from 'lru-cache';
 // 🔱 1. ON-CHAIN CONFIGURATION & GLOBAL INSTANCES
 // ============================================================================
 const CONTRACT_ADDRESS = '0x7d52930e1F0c6429200a0DFe02Be9Ac2d2A19Dd2';
-const FALLBACK_IMAGE = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
+const MASTER_IMAGE = 'https://gateway.irys.xyz/h7htGqvcxcaBF7RGj94s1GBucfAKDkVcHTSRQJRQTtR';
 
 const RPC_ENDPOINTS = [
   'https://base-mainnet.g.alchemy.com/v2/alch_AcCVEY7kJgG8EQ7qkQnQl',
@@ -47,46 +47,32 @@ const FETCH_HEADERS = {
 };
 
 // ============================================================================
-// ⚙️ 3. URL UNPACKER & DYNAMIC BASKET RESOLUTION (การแกะ URL)
+// ⚙️ 3. URI FORMATTER & GATEWAY RESOLVER
 // ============================================================================
 function parseRawUri(rawUri: string | null): string {
   if (!rawUri || rawUri.toUpperCase() === 'UNASSIGNED') return '';
   let trimmed = rawUri.trim();
   
-  // แปลง Protocol พื้นฐานให้ทะลุ Gateway
   if (/^[a-zA-Z0-9_-]{43}$/.test(trimmed)) return `https://gateway.irys.xyz/${trimmed}`; 
   if (trimmed.startsWith('ar://')) return `https://gateway.irys.xyz/${trimmed.replace('ar://', '')}`;
   if (trimmed.startsWith('ipfs://')) return `https://ipfs.io/ipfs/${trimmed.replace('ipfs://', '')}`;
   return trimmed;
 }
 
-// 🔥 [UPGRADE: MASTER OVERRIDE] ฟังก์ชันประกอบร่าง URL จาก "ไม้ตะกร้า"
-function resolveBasketUrl(uri: string, tokenId: string): string {
-  if (!uri) return '';
-  
-  // หาก URL จบด้วยนามสกุลไฟล์อยู่แล้ว (.png, .json, .mp4, ฯลฯ) ถือว่าเป็นไฟล์เดี่ยว ปล่อยผ่าน
-  if (uri.match(/\.[a-zA-Z0-9]{2,5}$/)) return uri;
-
-  // หาก URL ไม่มีนามสกุลไฟล์ ระบบจะตีความว่าเป็น "Directory/ไม้ตะกร้า" 
-  // และทำการประกอบร่าง /tokenId.png เข้าไปโดยอัตโนมัติ
-  const cleanUri = uri.replace(/\/$/, ''); // ตัด slash ตัวท้ายออก (ถ้ามี) ป้องกัน slash ซ้อนกัน
-  return `${cleanUri}/${tokenId}.png`;
-}
-
 // ============================================================================
-// ⚡ 4. GATEWAY RACER & CONTENT INSPECTOR 
+// ⚡ 4. GATEWAY RACER 
 // ============================================================================
 async function inspectAndRaceGateways(txId: string): Promise<{ url: string; contentType: string; jsonData?: any }> {
   if (!txId) return { url: '', contentType: 'unknown' };
 
-  const baseTx = txId.replace('ar://', '').replace('https://gateway.irys.xyz/', '').replace('https://arweave.net/', '');
   const isDirectHttp = txId.startsWith('http') && !txId.includes('irys.xyz') && !txId.includes('arweave.net');
+  const baseTx = txId.replace('ar://', '').replace('https://gateway.irys.xyz/', '').replace('https://arweave.net/', '');
   
   const irysUrl = isDirectHttp ? txId : `https://gateway.irys.xyz/${baseTx}`;
   const arUrl = isDirectHttp ? txId : `https://arweave.net/${baseTx}`;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3000); 
+  const timeoutId = setTimeout(() => controller.abort(), 3500); 
 
   try {
     const winnerRes = await Promise.any([
@@ -104,7 +90,7 @@ async function inspectAndRaceGateways(txId: string): Promise<{ url: string; cont
 
     return { url: winnerUrl, contentType };
   } catch (err) {
-    return { url: irysUrl, contentType: 'unknown' }; // Fallback
+    return { url: irysUrl, contentType: 'unknown' };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -153,9 +139,10 @@ async function getSovereignTruth(tokenId: bigint): Promise<any> {
 }
 
 // ============================================================================
-// 🚀 6. API SERVER (DELIVERY PROTOCOL)
+// 🚀 6. API SERVER (ABSOLUTE COMMAND)
 // ============================================================================
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
@@ -169,74 +156,75 @@ app.use((_req, res, next) => {
 app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<void> => {
   const cleanTokenIdStr = (req.params.tokenId || '').replace(/\.json$/, '');
   if (!/^\d+$/.test(cleanTokenIdStr)) { res.status(400).json({ error: 'INVALID_TOKEN_FORMAT' }); return; }
+  
   const numericId = BigInt(cleanTokenIdStr);
+  if (numericId < 1n || numericId > 333n) { res.status(404).json({ error: 'TOKEN_OUT_OF_RANGE' }); return; }
 
   const cacheKey = `metadata_${cleanTokenIdStr}`;
-  if (metadataCache.has(cacheKey)) {
-    res.status(200).json(metadataCache.get(cacheKey));
-    return;
-  }
+  if (metadataCache.has(cacheKey)) { res.status(200).json(metadataCache.get(cacheKey)); return; }
 
   try {
     const truth = await getSovereignTruth(numericId);
 
+    // 🛑 ตรวจสอบการ Burn หรือยังไม่มิ้นข้อมูล (ไม่ออก Master Image มั่วซั่ว คืนค่าตามจริงหรือสถานะ Unassigned)
     if (!truth.active || truth.owner === '0x0000000000000000000000000000000000000000') {
-      res.status(404).json({ error: 'TOKEN_BURNED_OR_INACTIVE' }); return;
+      res.status(404).json({ error: 'TOKEN_UNASSIGNED_OR_BURNED', message: 'Token has not been minted or has been burned.' });
+      return;
     }
 
-    // 💥 เรียกใช้งานฟังก์ชัน "แกะ URL ไม้ตะกร้า" ก่อนนำไปยิง Gateway
-    const resolvedFront = resolveBasketUrl(truth.front, cleanTokenIdStr);
-    const inspection = await inspectAndRaceGateways(resolvedFront);
+    const inspection = await inspectAndRaceGateways(truth.front);
+    let finalResponseData: any = {};
 
-    let finalResponseData: any;
-
-    if (inspection.contentType.includes('application/json') || inspection.jsonData) {
+    if (inspection.jsonData) {
       finalResponseData = inspection.jsonData;
     } else {
-      // โครงสร้างมาตรฐานตามภาพอ้างอิงของคุณ
       finalResponseData = {
         name: `THE IMPERIAL SOVEREIGN DEED ♠️ #${cleanTokenIdStr}`,
         description: 'IMPERIAL SOVEREIGN ARCHITECTURE - Absolute Immutable Autarkic Identity Manifest',
         attributes: [
           { trait_type: 'RANK', value: 'THE COUNCIL PRIME' },
-          { trait_type: 'IDENTITY STATUS', value: 'UNCOMPROMISED INTEGRITY PROTOCOL' }
+          { trait_type: 'IDENTITY STATUS', value: truth.sanctified ? 'SANCTIFIED (NOVA)' : 'UNCOMPROMISED INTEGRITY PROTOCOL' }
         ]
       };
 
-      // ควบคุมการแสดงผล Image / Animation URL
       if (inspection.contentType.includes('video') || inspection.url.endsWith('.mp4')) {
         finalResponseData.animation_url = inspection.url;
-        finalResponseData.image = FALLBACK_IMAGE;
-      } else {
-        // นำ URL ที่ถูกแกะและประกอบร่างสมบูรณ์ (เช่น .../333.png) มาแสดงผล
-        finalResponseData.image = inspection.url || FALLBACK_IMAGE;
+      } else if (inspection.url) {
+        finalResponseData.image = inspection.url;
       }
+    }
 
-      // จัดการส่วน Back / Video (รองรับระบบไม้ตะกร้าเช่นกัน)
-      if (truth.video || truth.back) {
-        const targetSecondary = truth.video ? truth.video : truth.back;
-        const resolvedSecondary = resolveBasketUrl(targetSecondary, cleanTokenIdStr);
-        const secInspection = await inspectAndRaceGateways(resolvedSecondary);
+    if (truth.video || truth.back) {
+      const targetSecondary = truth.video ? truth.video : truth.back;
+      const secInspection = await inspectAndRaceGateways(targetSecondary);
+      if (secInspection.url) {
         finalResponseData.animation_url = secInspection.url;
       }
+    }
 
-      if (truth.hidden) finalResponseData.external_url = truth.hidden;
+    if (truth.hidden && truth.hidden.toUpperCase() !== 'UNASSIGNED') {
+      finalResponseData.external_url = truth.hidden;
+    }
+
+    if (truth.dna && truth.dna.toUpperCase() !== 'UNASSIGNED') {
+      if (!finalResponseData.attributes) finalResponseData.attributes = [];
       
-      // Inject TBA Address (ถ้ามี)
-      if (truth.tba && truth.tba !== '0x0000000000000000000000000000000000000000') {
-        finalResponseData.attributes.push({ trait_type: 'Token Bound Account', value: truth.tba });
-      }
+      const segments = truth.dna.split('|');
+      segments.forEach(segment => {
+        const firstColonIdx = segment.indexOf(':');
+        if (firstColonIdx > -1) {
+          const key = segment.substring(0, firstColonIdx).trim();
+          const value = segment.substring(firstColonIdx + 1).trim();
+          
+          const exists = finalResponseData.attributes.find((a: any) => a.trait_type === key);
+          if (!exists) finalResponseData.attributes.push({ trait_type: key, value: value });
+        }
+      });
+    }
 
-      // Inject DNA Traits (ถ้ามี)
-      if (truth.sanctified && truth.dna && truth.dna.toUpperCase() !== 'UNASSIGNED') {
-        const cleanDna = truth.dna.replace(/^.*?STRINGS\s+MEMORY\s+DNA\s*:\s*/i, '').trim();
-        cleanDna.split('|').forEach(segment => {
-          const [key, ...valParts] = segment.split(':');
-          if (key && valParts.length) {
-            finalResponseData.attributes.push({ trait_type: key.trim(), value: valParts.join(':').trim() });
-          }
-        });
-      }
+    if (truth.tba && truth.tba !== '0x0000000000000000000000000000000000000000') {
+      if (!finalResponseData.attributes) finalResponseData.attributes = [];
+      finalResponseData.attributes.push({ trait_type: 'Token Bound Account', value: truth.tba });
     }
 
     metadataCache.set(cacheKey, finalResponseData);
@@ -246,11 +234,7 @@ app.get('/api/metadata/:tokenId', async (req: Request, res: Response): Promise<v
     if (error.message === 'TOKEN_NOT_FOUND') {
       res.status(404).json({ error: 'TOKEN_NOT_FOUND' });
     } else {
-      res.status(200).json({
-        name: `Sovereign Deed #${cleanTokenIdStr}`,
-        description: 'Syncing to blockchain...',
-        image: FALLBACK_IMAGE
-      });
+      res.status(503).json({ error: 'RPC_UNAVAILABLE', message: 'Blockchain consensus delayed. Retry imminent.' });
     }
   }
 });
